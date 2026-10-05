@@ -40,7 +40,7 @@ target_link_libraries(my_app PRIVATE meros::aes67 meros::mdns)
 Headers are included as `<aes67/rx.h>`, `<aes67/tx.h>`, `<aes67/sdp.h>`, `<aes67/rtp.h>`, `<aes67/netrx.h>` and
 `<mdns/mdns.h>`.
 
-Used by Manifold (a digital mixing console) and Inlet (a virtual AES67 sound card).
+Used by Meros Inc. in its own audio-over-IP products.
 
 ## Licence
 

@@ -407,7 +407,7 @@ static mdns_t *make(const char *hostname, const char *ipv4)
     mdns_t *m = (mdns_t *) calloc(1, sizeof *m);
     if (!m)
         return NULL;
-    snprintf(m->hostname, sizeof m->hostname, "%s.local", hostname && *hostname ? hostname : "manifold");
+    snprintf(m->hostname, sizeof m->hostname, "%s.local", hostname && *hostname ? hostname : "mdns-node");
     m->sock = MDNS_BAD_SOCK;
     if (ipv4 && *ipv4) {
         unsigned a, b, c, d;

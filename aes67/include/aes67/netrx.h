@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_NETRX_H
-#define MANIFOLD_AES67_NETRX_H
+#ifndef MEROS_AES67_NETRX_H
+#define MEROS_AES67_NETRX_H
 
 /* libaes67 network receive into rings the caller owns.
  *
@@ -95,4 +95,4 @@ bool aes67_parse_ipv4(const char *text, uint32_t *out);
 }
 #endif
 
-#endif /* MANIFOLD_AES67_NETRX_H */
+#endif /* MEROS_AES67_NETRX_H */

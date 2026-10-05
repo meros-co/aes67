@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_TX_H
-#define MANIFOLD_AES67_TX_H
+#ifndef MEROS_AES67_TX_H
+#define MEROS_AES67_TX_H
 
 /* libaes67 transmit: frames in, RTP/L24 multicast packets out, plus the SDP
  * that makes the stream subscribable and a SAP announcer for receivers that
@@ -81,4 +81,4 @@ void aes67_tx_close(aes67_tx_t *tx);
 }
 #endif
 
-#endif /* MANIFOLD_AES67_TX_H */
+#endif /* MEROS_AES67_TX_H */

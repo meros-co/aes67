@@ -208,7 +208,7 @@ int aes67_sdp_write(char *buf, size_t len, const aes67_sdp_params_t *p)
         "a=ptime:%.3f\r\n"
         "a=mediaclk:direct=0\r\n",
         p->ssrc, p->origin_ip ? p->origin_ip : "0.0.0.0",
-        p->session_name && p->session_name[0] ? p->session_name : "manifold",
+        p->session_name && p->session_name[0] ? p->session_name : "aes67",
         p->group, p->ttl ? p->ttl : 15,
         p->ptp_domain,
         p->port, p->payload_type,

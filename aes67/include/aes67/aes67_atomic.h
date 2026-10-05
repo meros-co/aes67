@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_ATOMIC_H
-#define MANIFOLD_AES67_ATOMIC_H
+#ifndef MEROS_AES67_ATOMIC_H
+#define MEROS_AES67_ATOMIC_H
 
 /* The atomics libaes67's rings and receivers use, under names of its own.
  *
@@ -116,4 +116,4 @@ static __forceinline void aes67__msvc_store(volatile long long *p, uint64_t v, i
 #  error "libaes67 needs C11 atomics, GCC/Clang builtins or MSVC"
 #endif
 
-#endif /* MANIFOLD_AES67_ATOMIC_H */
+#endif /* MEROS_AES67_ATOMIC_H */

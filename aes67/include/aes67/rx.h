@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_RX_H
-#define MANIFOLD_AES67_RX_H
+#ifndef MEROS_AES67_RX_H
+#define MEROS_AES67_RX_H
 
 /* libaes67 receive: N multicast streams -> RTP -> per-channel playout rings.
  *
@@ -100,4 +100,4 @@ void aes67_rx_inject(aes67_rx_t *rx, int stream, const uint8_t *packet, size_t l
 }
 #endif
 
-#endif /* MANIFOLD_AES67_RX_H */
+#endif /* MEROS_AES67_RX_H */

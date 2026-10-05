@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_RTP_H
-#define MANIFOLD_AES67_RTP_H
+#ifndef MEROS_AES67_RTP_H
+#define MEROS_AES67_RTP_H
 
 /* libaes67 -- the parts of an AES67 stream that are pure arithmetic.
  *
@@ -161,4 +161,4 @@ int aes67_sdp_write(char *buf, size_t len, const aes67_sdp_params_t *p);
 }
 #endif
 
-#endif /* MANIFOLD_AES67_RTP_H */
+#endif /* MEROS_AES67_RTP_H */

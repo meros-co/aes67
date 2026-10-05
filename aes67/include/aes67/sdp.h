@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 Meros Inc. */
 
-#ifndef MANIFOLD_AES67_SDP_H
-#define MANIFOLD_AES67_SDP_H
+#ifndef MEROS_AES67_SDP_H
+#define MEROS_AES67_SDP_H
 
 /* libaes67 SDP parsing. Generation lives in rtp.h beside the packet
  * arithmetic; this is the other direction: an SDP that arrived by SAP, from
@@ -93,4 +93,4 @@ bool aes67_sdp_shares_grandmaster(const aes67_sdp_t *sdp, const uint8_t our_gm[8
 }
 #endif
 
-#endif /* MANIFOLD_AES67_SDP_H */
+#endif /* MEROS_AES67_SDP_H */

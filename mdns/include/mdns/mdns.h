@@ -23,8 +23,8 @@
  * arithmetic (mdns_build_*, mdns_parse_message) has no socket in it and
  * is what the tests pin.
  */
-#ifndef MANIFOLD_MDNS_H
-#define MANIFOLD_MDNS_H
+#ifndef MEROS_MDNS_H
+#define MEROS_MDNS_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -100,7 +100,7 @@ size_t mdns_build_response(uint8_t *buf, size_t cap, const mdns_record_t *record
 /* -------------------------------------------------------------- services */
 
 typedef struct mdns_service {
-    char     instance[64];               /* "Manifold Console" -- shown to people */
+    char     instance[64];               /* "FOH Console" -- shown to people */
     char     type[64];                   /* "_nmos-node._tcp" */
     uint16_t port;
     int      txt_count;
@@ -122,7 +122,7 @@ typedef struct mdns_result {
 typedef struct mdns mdns_t;
 
 /* Opens the socket. `hostname` is the bare name this machine answers for
- * ("manifold-1"; ".local" is appended); `ipv4` is the address the A record
+ * ("node-1"; ".local" is appended); `ipv4` is the address the A record
  * carries and the interface multicast goes out of. Null with `err` set. */
 mdns_t *mdns_open(const char *hostname, const char *ipv4, char *err, size_t err_len);
 void    mdns_close(mdns_t *m);          /* says goodbye for every service */

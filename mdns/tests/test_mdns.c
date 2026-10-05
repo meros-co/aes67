@@ -28,7 +28,7 @@ static mdns_service_t nmos_node(void)
 {
     mdns_service_t s;
     memset(&s, 0, sizeof s);
-    strcpy(s.instance, "Manifold Console");
+    strcpy(s.instance, "FOH Console");
     strcpy(s.type, "_nmos-node._tcp");
     s.port = 8080;
     s.txt_count = 2;
@@ -85,12 +85,12 @@ static void test_records_round_trip(void)
     const mdns_record_t *ptr = &msg.records[0];
     CHECK(ptr->type == MDNS_TYPE_PTR);
     CHECK(strcmp(ptr->name, "_nmos-node._tcp.local") == 0);
-    CHECK(strcmp(ptr->rd.ptr.target, "Manifold Console._nmos-node._tcp.local") == 0);
+    CHECK(strcmp(ptr->rd.ptr.target, "FOH Console._nmos-node._tcp.local") == 0);
     CHECK(ptr->ttl == 4500 && !ptr->cache_flush);
 
     const mdns_record_t *srv = &msg.records[1];
     CHECK(srv->type == MDNS_TYPE_SRV);
-    CHECK(strcmp(srv->name, "Manifold Console._nmos-node._tcp.local") == 0);
+    CHECK(strcmp(srv->name, "FOH Console._nmos-node._tcp.local") == 0);
     CHECK(srv->rd.srv.port == 8080);
     CHECK(strcmp(srv->rd.srv.target, "box.local") == 0);
     CHECK(srv->ttl == 120 && srv->cache_flush);
@@ -192,7 +192,7 @@ static void test_responder_answers_a_browse(void)
     mdns_service_t svc = nmos_node();
     CHECK(mdns_add_service(m, &svc));
 
-    /* The browse (what Sluice sends): PTR, and everything needed to use
+    /* The browse (what an NMOS controller sends): PTR, and everything needed to use
        the result rides along so no second round trip is needed. */
     mdns_message_t r;
     CHECK(ask(m, "_nmos-node._tcp.local", MDNS_TYPE_PTR, &r) > 0);
@@ -207,9 +207,9 @@ static void test_responder_answers_a_browse(void)
     CHECK(ask(m, "nobody.local", MDNS_TYPE_A, &r) == 0);
 
     /* Direct questions about the instance and the host. */
-    CHECK(ask(m, "Manifold Console._nmos-node._tcp.local", MDNS_TYPE_SRV, &r) > 0);
+    CHECK(ask(m, "FOH Console._nmos-node._tcp.local", MDNS_TYPE_SRV, &r) > 0);
     CHECK(count_type(&r, MDNS_TYPE_SRV) == 1 && count_type(&r, MDNS_TYPE_A) == 1 && count_type(&r, MDNS_TYPE_TXT) == 0);
-    CHECK(ask(m, "manifold console._NMOS-NODE._tcp.local", MDNS_TYPE_TXT, &r) > 0);   /* case-folded */
+    CHECK(ask(m, "foh console._NMOS-NODE._tcp.local", MDNS_TYPE_TXT, &r) > 0);   /* case-folded */
     CHECK(count_type(&r, MDNS_TYPE_TXT) == 1);
     CHECK(ask(m, "console.local", MDNS_TYPE_A, &r) > 0);
     CHECK(r.record_count == 1 && r.records[0].rd.a.addr[0] == 10);
@@ -220,7 +220,7 @@ static void test_responder_answers_a_browse(void)
 
     /* Two services, one query: both answered, records not repeated. */
     mdns_service_t second = nmos_node();
-    strcpy(second.instance, "Manifold Stagebox");
+    strcpy(second.instance, "Stage Rack");
     second.port = 8081;
     CHECK(mdns_add_service(m, &second));
     CHECK(ask(m, "_nmos-node._tcp.local", MDNS_TYPE_ANY, &r) > 0);
@@ -231,7 +231,7 @@ static void test_responder_answers_a_browse(void)
     /* Re-adding an instance replaces it. */
     second.port = 9000;
     CHECK(mdns_add_service(m, &second));
-    CHECK(ask(m, "Manifold Stagebox._nmos-node._tcp.local", MDNS_TYPE_SRV, &r) > 0);
+    CHECK(ask(m, "Stage Rack._nmos-node._tcp.local", MDNS_TYPE_SRV, &r) > 0);
     CHECK(r.records[0].rd.srv.port == 9000);
 
     /* A response packet is never answered (no storms). */
@@ -257,11 +257,11 @@ static void on_result(const mdns_result_t *r, void *user)
 
 static void test_browser_assembles_a_result(void)
 {
-    /* The registry, as Sluice advertises it; the node, browsing for it. */
-    mdns_t *registry = mdns_open_detached("sluice-box", "10.1.1.9");
+    /* The registry, as an NMOS registry advertises it; the node, browsing for it. */
+    mdns_t *registry = mdns_open_detached("registry-box", "10.1.1.9");
     mdns_service_t reg;
     memset(&reg, 0, sizeof reg);
-    strcpy(reg.instance, "sluice");
+    strcpy(reg.instance, "registry");
     strcpy(reg.type, "_nmos-register._tcp");
     reg.port = 3210;
     reg.txt_count = 3;
@@ -283,9 +283,9 @@ static void test_browser_assembles_a_result(void)
     CHECK(rn > 0);
     CHECK(mdns_handle_packet(node, resp, rn, follow, sizeof follow, on_result, &seen) == 0);
     CHECK(seen.calls == 1);
-    CHECK(strcmp(seen.last.instance, "sluice") == 0);
+    CHECK(strcmp(seen.last.instance, "registry") == 0);
     CHECK(strcmp(seen.last.type, "_nmos-register._tcp") == 0);
-    CHECK(strcmp(seen.last.host, "sluice-box.local") == 0);
+    CHECK(strcmp(seen.last.host, "registry-box.local") == 0);
     CHECK(strcmp(seen.last.ipv4, "10.1.1.9") == 0);
     CHECK(seen.last.port == 3210);
     CHECK(seen.last.txt_count == 3 && strcmp(seen.last.txt[2], "pri=100") == 0);
@@ -312,7 +312,7 @@ static void test_browser_assembles_a_result(void)
     /* Records spread across packets, the PTR alone first: the browser asks
        for the SRV, then the A, and reports once it has both. */
     mdns_service_t reg2 = reg;
-    strcpy(reg2.instance, "sluice-2");
+    strcpy(reg2.instance, "registry-2");
     reg2.port = 3211;
     mdns_t *registry2 = mdns_open_detached("second-box", "10.1.1.10");
     mdns_add_service(registry2, &reg2);
@@ -323,7 +323,7 @@ static void test_browser_assembles_a_result(void)
     mdns_message_t fq;
     CHECK(fn > 0 && mdns_parse_message(follow, fn, &fq) && fq.question_count == 1);
     CHECK(fq.questions[0].type == MDNS_TYPE_SRV);
-    CHECK(strcmp(fq.questions[0].name, "sluice-2._nmos-register._tcp.local") == 0);
+    CHECK(strcmp(fq.questions[0].name, "registry-2._nmos-register._tcp.local") == 0);
 
     size_t sn = mdns_build_response(resp, sizeof resp, recs + 1, 2);          /* SRV + TXT */
     fn = mdns_handle_packet(node, resp, sn, follow, sizeof follow, on_result, &seen);
@@ -334,7 +334,7 @@ static void test_browser_assembles_a_result(void)
     size_t an = mdns_build_response(resp, sizeof resp, recs + 3, 1);          /* A */
     CHECK(mdns_handle_packet(node, resp, an, follow, sizeof follow, on_result, &seen) == 0);
     CHECK(seen.calls == 2);
-    CHECK(strcmp(seen.last.instance, "sluice-2") == 0 && strcmp(seen.last.ipv4, "10.1.1.10") == 0);
+    CHECK(strcmp(seen.last.instance, "registry-2") == 0 && strcmp(seen.last.ipv4, "10.1.1.10") == 0);
     CHECK(seen.last.port == 3211);
 
     /* A changed port is a change worth hearing about. */
@@ -349,7 +349,7 @@ static void test_browser_assembles_a_result(void)
     for (int i = 0; i < 4; ++i) recs[i].ttl = 0;
     size_t gn = mdns_build_response(resp, sizeof resp, recs, 4);
     mdns_handle_packet(node, resp, gn, follow, sizeof follow, on_result, &seen);
-    CHECK(seen.calls == 4 && seen.goodbyes == 1 && strcmp(seen.last.instance, "sluice-2") == 0);
+    CHECK(seen.calls == 4 && seen.goodbyes == 1 && strcmp(seen.last.instance, "registry-2") == 0);
     mdns_handle_packet(node, resp, gn, follow, sizeof follow, on_result, &seen);
     CHECK(seen.calls == 4);
 
@@ -357,7 +357,7 @@ static void test_browser_assembles_a_result(void)
     mdns_expire(node, 1, on_result, &seen);
     CHECK(seen.goodbyes == 1);                        /* not yet */
     mdns_expire(node, (uint64_t) 1 << 62, on_result, &seen);   /* the clock is the real one: far enough */
-    CHECK(seen.goodbyes == 2 && strcmp(seen.last.instance, "sluice") == 0);
+    CHECK(seen.goodbyes == 2 && strcmp(seen.last.instance, "registry") == 0);
 
     mdns_close(registry);
     mdns_close(registry2);
