@@ -5,6 +5,53 @@
 
 #include "aes67/rtp.h"
 
+#include <string.h>
+
+int aes67_format_bytes(aes67_sample_format_t format)
+{
+    return format == AES67_FORMAT_L16 ? 2 : format == AES67_FORMAT_AM824 ? 4 : 3;
+}
+
+bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out)
+{
+    if (encoding == NULL || strcmp(encoding, "L24") == 0 || encoding[0] == '\0') { *out = AES67_FORMAT_L24; return true; }
+    if (strcmp(encoding, "L16") == 0)   { *out = AES67_FORMAT_L16;   return true; }
+    if (strcmp(encoding, "AM824") == 0) { *out = AES67_FORMAT_AM824; return true; }
+    return false;
+}
+
+int aes67_rtp_write_rings(const uint8_t *packet, size_t len, uint8_t payload_type,
+                          aes67_sample_format_t format, int channels, uint32_t media_clock_offset,
+                          aes67_ring_t *rings, aes67_rtp_header_t *header)
+{
+    aes67_rtp_header_t h;
+    if (!aes67_rtp_parse_header(packet, len, &h))
+        return AES67_PACKET_MALFORMED;
+    if (header != NULL)
+        *header = h;
+    if (h.payload_type != payload_type)
+        return AES67_PACKET_WRONG_PT;
+    if (rings == NULL || channels <= 0)
+        return 0;
+
+    const int bps = aes67_format_bytes(format);
+    const int frames = (int) ((len - AES67_RTP_HEADER_BYTES) / (size_t) (bps * channels));
+    const uint32_t ts0 = h.timestamp - media_clock_offset;   /* the media clock the rings are indexed by */
+    const uint8_t *d = packet + AES67_RTP_HEADER_BYTES;
+    for (int f = 0; f < frames; ++f)
+        for (int c = 0; c < channels; ++c, d += bps) {
+            int32_t v;
+            if (format == AES67_FORMAT_L16)
+                v = (int32_t) (int16_t) (((uint16_t) d[0] << 8) | d[1]) * 256;   /* to 24-bit scale */
+            else if (format == AES67_FORMAT_AM824)
+                v = aes67_l24_to_i32(d + 1);   /* the AES3 flags octet first, then the audio word */
+            else
+                v = aes67_l24_to_i32(d);
+            aes67_ring_write(&rings[c], ts0 + (uint32_t) f, v);
+        }
+    return frames;
+}
+
 int aes67_max_channels(int bytes_per_sample, int frames_per_packet)
 {
     if (bytes_per_sample <= 0 || frames_per_packet <= 0)

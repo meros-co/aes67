@@ -37,20 +37,6 @@ extern "C" {
    carry, sized when it opens. How many one stream can carry is the packet's
    business (aes67_max_channels). */
 
-/* How samples sit in the payload. L24 is AES67's own; L16 is allowed by
-   it; AM824 is ST 2110-31, AES3 subframes of four octets whose last three
-   are the audio word (the first carries the AES3 flags). */
-typedef enum aes67_sample_format {
-    AES67_FORMAT_L24 = 0,
-    AES67_FORMAT_L16 = 1,
-    AES67_FORMAT_AM824 = 2,
-} aes67_sample_format_t;
-
-/* Bytes per sample for a format; the rtpmap encoding name to a format
-   (false for one this library does not decode). */
-int  aes67_format_bytes(aes67_sample_format_t format);
-bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out);
-
 typedef struct aes67_rx_stream_cfg {
     char     group[16];        /* dotted-quad multicast group */
     uint16_t port;             /* AES67 convention: 5004, shared */

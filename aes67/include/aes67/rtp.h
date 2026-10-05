@@ -93,6 +93,46 @@ int aes67_ring_read(const aes67_ring_t *r, uint32_t ts, int32_t *out, int frames
 /* The writer's head, for playout scheduling. */
 uint32_t aes67_ring_head(const aes67_ring_t *r);
 
+/* How samples sit in the payload. L24 is AES67's own; L16 is allowed by
+   it; AM824 is ST 2110-31, AES3 subframes of four octets whose last three
+   are the audio word (the first carries the AES3 flags). */
+typedef enum aes67_sample_format {
+    AES67_FORMAT_L24 = 0,
+    AES67_FORMAT_L16 = 1,
+    AES67_FORMAT_AM824 = 2,
+} aes67_sample_format_t;
+
+/* Bytes per sample for a format; the rtpmap encoding name to a format
+   (false for one this library does not decode). */
+int  aes67_format_bytes(aes67_sample_format_t format);
+bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out);
+
+/* ---- a received packet into rings ---------------------------------------
+ *
+ * The decode step on its own, for a receiver that owns its sockets and its
+ * rings (shared memory a driver reads, say): one RTP packet in, its samples
+ * written to the caller's rings. aes67_rx and aes67_netrx use it too.
+ */
+
+#define AES67_PACKET_MALFORMED  (-1)   /* too short, or not RTP version 2 */
+#define AES67_PACKET_WRONG_PT   (-2)   /* not the payload type expected */
+
+/* Writes the samples of one RTP packet into `rings`, one ring per channel of
+   the stream, in channel order. Frame f of the packet lands at the packet's
+   RTP timestamp + f - `media_clock_offset` (the SDP's
+   `a=mediaclk:direct=<offset>`), so a ring is indexed by the media clock and a
+   reader finds a sample at the media-clock time it was taken. L16 is scaled to
+   24 bits; AM824's flags octet is skipped.
+
+   Returns the frames written, or AES67_PACKET_MALFORMED or
+   AES67_PACKET_WRONG_PT, in which case nothing is written. `header`, when not
+   NULL, gets the parsed header (for the caller's sequence and loss counting)
+   whenever it could be parsed. NULL `rings` checks and parses only. Single
+   writer per ring, like aes67_ring_write. */
+int aes67_rtp_write_rings(const uint8_t *packet, size_t len, uint8_t payload_type,
+                          aes67_sample_format_t format, int channels, uint32_t media_clock_offset,
+                          aes67_ring_t *rings, aes67_rtp_header_t *header);
+
 /* ---- SDP ----------------------------------------------------------------- */
 
 typedef struct aes67_sdp_params {

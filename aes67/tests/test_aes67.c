@@ -7,6 +7,7 @@
    loopback -- a real socket round trip. */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "aes67/rtp.h"
@@ -173,6 +174,46 @@ static size_t build_packet(uint8_t *pkt, size_t cap, uint8_t pt, uint16_t seq, u
             samples[f * channels + c] = base + f * 10 + c;
     aes67_rtp_header_t h = { pt, false, seq, ts, 0x1234 };
     return aes67_rtp_pack_l24(pkt, cap, &h, samples, frames, channels);
+}
+
+/* The decode step alone, into rings the caller owns, at a media-clock offset:
+   what a receiver with its own sockets and shared-memory rings uses. */
+static void test_packets_into_the_callers_rings(void)
+{
+    aes67_ring_t *rings = (aes67_ring_t *) calloc(3, sizeof *rings);
+    CHECK(rings != NULL);
+    if (rings == NULL)
+        return;
+    for (int i = 0; i < 3; ++i)
+        aes67_ring_init(&rings[i]);
+
+    uint8_t pkt[1500];
+    aes67_rtp_header_t h;
+    size_t n = build_packet(pkt, sizeof pkt, 97, 40, 5000, 6, 3, 700);
+    /* a=mediaclk:direct=1000: RTP 5000 is media-clock 4000. */
+    CHECK(aes67_rtp_write_rings(pkt, n, 97, AES67_FORMAT_L24, 3, 1000, rings, &h) == 6);
+    CHECK(h.sequence == 40 && h.timestamp == 5000);
+    int32_t out[6];
+    CHECK(aes67_ring_read(&rings[0], 4000, out, 6) == 6 && out[0] == 700 && out[5] == 750);
+    CHECK(aes67_ring_read(&rings[2], 4000, out, 6) == 6 && out[0] == 702);
+    CHECK(aes67_ring_read(&rings[0], 5000, out, 1) == 0);           /* not at the RTP timestamp */
+
+    /* Refused packets write nothing, and say why. */
+    n = build_packet(pkt, sizeof pkt, 96, 41, 5006, 6, 3, 900);
+    CHECK(aes67_rtp_write_rings(pkt, n, 97, AES67_FORMAT_L24, 3, 1000, rings, &h) == AES67_PACKET_WRONG_PT);
+    CHECK(h.sequence == 41);                                          /* parsed, for loss counting */
+    CHECK(aes67_rtp_write_rings(pkt, 5, 97, AES67_FORMAT_L24, 3, 1000, rings, NULL) == AES67_PACKET_MALFORMED);
+    CHECK(aes67_ring_read(&rings[0], 4006, out, 6) == 0);
+
+    /* L16 lands at 24-bit scale; the offset wraps with the 32-bit clock. */
+    uint8_t l16[AES67_RTP_HEADER_BYTES + 4];
+    aes67_rtp_header_t hh = { 97, false, 42, 10, 1 };
+    aes67_rtp_write_header(l16, &hh);
+    l16[12] = 0x01; l16[13] = 0x00;          /* frame 0: 256 */
+    l16[14] = 0xFF; l16[15] = 0xFF;          /* frame 1: -1 */
+    CHECK(aes67_rtp_write_rings(l16, sizeof l16, 97, AES67_FORMAT_L16, 1, 20, rings, NULL) == 2);
+    CHECK(aes67_ring_read(&rings[0], (uint32_t) -10, out, 2) == 2 && out[0] == 256 * 256 && out[1] == -256);
+    free(rings);
 }
 
 static void test_receive_path_end_to_end(void)
@@ -889,6 +930,7 @@ int main(void)
     test_pack_respects_the_mtu();
     test_ring_is_timestamp_indexed();
     test_sdp_says_what_a_receiver_needs();
+    test_packets_into_the_callers_rings();
     test_receive_path_end_to_end();
     test_transmit_builds_what_receive_reads();
     test_socket_round_trip_if_possible();

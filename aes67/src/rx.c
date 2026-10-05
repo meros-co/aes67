@@ -104,8 +104,12 @@ static void process_packet(aes67_rx_t *rx, aes67_rx_stream_t *s, const uint8_t *
 {
     aes67_rx_stream_stats_t *st = &s->stats;
     aes67_rtp_header_t h;
-    if (!aes67_rtp_parse_header(p, len, &h)) { st->too_short++; return; }
-    if (h.payload_type != s->cfg.payload_type) { st->wrong_pt++; return; }
+    /* The rings are this receiver's, one per channel the streams carry; the
+       stream's start at its first channel, indexed by RTP timestamp. */
+    const int got = aes67_rtp_write_rings(p, len, s->cfg.payload_type, (aes67_sample_format_t) s->cfg.format,
+                                          s->cfg.channels, 0, rx->rings + s->cfg.first_channel, &h);
+    if (got == AES67_PACKET_MALFORMED) { st->too_short++; return; }
+    if (got == AES67_PACKET_WRONG_PT) { st->wrong_pt++; return; }
 
     if (s->have_seq) {
         const uint16_t expect = (uint16_t) (s->last_seq + 1);
@@ -128,42 +132,6 @@ static void process_packet(aes67_rx_t *rx, aes67_rx_stream_t *s, const uint8_t *
     s->last_arr_ns = arr_ns;
     st->packets++;
     st->bytes += (uint64_t) len;
-
-    const int cps = s->cfg.channels;
-    if (cps <= 0)
-        return;
-    const aes67_sample_format_t fmt = (aes67_sample_format_t) s->cfg.format;
-    const int bps = aes67_format_bytes(fmt);
-    const size_t payload = len - AES67_RTP_HEADER_BYTES;
-    const int frames = (int) (payload / (size_t) (bps * cps));
-    const uint8_t *d = p + AES67_RTP_HEADER_BYTES;
-    for (int f = 0; f < frames; ++f)
-        for (int c = 0; c < cps; ++c, d += bps) {
-            const int ch = s->cfg.first_channel + c;
-            if (ch >= rx->ring_count)
-                continue;
-            int32_t v;
-            if (fmt == AES67_FORMAT_L16)
-                v = (int32_t) (int16_t) (((uint16_t) d[0] << 8) | d[1]) * 256;   /* to 24-bit scale */
-            else if (fmt == AES67_FORMAT_AM824)
-                v = aes67_l24_to_i32(d + 1);   /* the AES3 flags octet first, then the audio word */
-            else
-                v = aes67_l24_to_i32(d);
-            aes67_ring_write(&rx->rings[ch], h.timestamp + (uint32_t) f, v);
-        }
-}
-
-int aes67_format_bytes(aes67_sample_format_t format)
-{
-    return format == AES67_FORMAT_L16 ? 2 : format == AES67_FORMAT_AM824 ? 4 : 3;
-}
-
-bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out)
-{
-    if (encoding == NULL || strcmp(encoding, "L24") == 0 || encoding[0] == '\0') { *out = AES67_FORMAT_L24; return true; }
-    if (strcmp(encoding, "L16") == 0)   { *out = AES67_FORMAT_L16;   return true; }
-    if (strcmp(encoding, "AM824") == 0) { *out = AES67_FORMAT_AM824; return true; }
-    return false;
 }
 
 void aes67_rx_inject(aes67_rx_t *rx, int stream, const uint8_t *packet, size_t len, uint64_t arrival_ns)
