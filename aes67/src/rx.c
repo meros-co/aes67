@@ -306,7 +306,7 @@ static void *rx_thread_main(void *arg)
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* best effort */
 
     struct epoll_event evs[AES67_RX_MAX_STREAMS];
-    while (atomic_load_explicit(&rx->running, memory_order_relaxed)) {
+    while (aes67_atomic_load(&rx->running, AES67_MO_RELAXED)) {
         const int n = epoll_wait(rx->epfd, evs, AES67_RX_MAX_STREAMS, 100);
         for (int i = 0; i < n; ++i)
             drain_stream(rx, (aes67_rx_stream_t *) evs[i].data.ptr);
@@ -464,7 +464,7 @@ static void drain_socket(aes67_rx_t *rx, int sock)
         if (matched == 0 && dst == 0 && groups == 1 && only >= 0)
             process_packet(rx, &rx->streams[only], buf, (size_t) n, arrived);
         else if (matched == 0)
-            atomic_fetch_add_explicit(&rx->not_ours, 1, memory_order_relaxed);
+            aes67_atomic_fetch_add(&rx->not_ours, 1, AES67_MO_RELAXED);
     }
 }
 
@@ -481,7 +481,7 @@ static void *rx_thread_main(void *arg)
 #else
     struct pollfd fds[AES67_RX_MAX_STREAMS];
 #endif
-    while (atomic_load_explicit(&rx->running, memory_order_relaxed)) {
+    while (aes67_atomic_load(&rx->running, AES67_MO_RELAXED)) {
         for (int i = 0; i < rx->sock_count; ++i) {
             fds[i].fd = rx->socks[i];
             fds[i].events = POLLIN;
@@ -627,7 +627,7 @@ bool aes67_rx_start(aes67_rx_t *rx)
 {
     if (rx->have_thread)
         return true;
-    atomic_store(&rx->running, 1);
+    aes67_atomic_store(&rx->running, 1, AES67_MO_SEQ_CST);
 #if defined(_WIN32)
     rx->thread = (HANDLE) _beginthreadex(NULL, 0, rx_thread_main, rx, 0, NULL);
     rx->have_thread = rx->thread != NULL;
@@ -635,7 +635,7 @@ bool aes67_rx_start(aes67_rx_t *rx)
     rx->have_thread = pthread_create(&rx->thread, NULL, rx_thread_main, rx) == 0;
 #endif
     if (!rx->have_thread)
-        atomic_store(&rx->running, 0);
+        aes67_atomic_store(&rx->running, 0, AES67_MO_SEQ_CST);
     return rx->have_thread;
 }
 
@@ -672,7 +672,7 @@ uint64_t aes67_rx_foreign_packets(aes67_rx_t *rx)
     (void) rx;
     return 0;   /* each socket is bound to its group: the kernel never hands us another's */
 #else
-    return atomic_load_explicit(&rx->not_ours, memory_order_relaxed);
+    return aes67_atomic_load(&rx->not_ours, AES67_MO_RELAXED);
 #endif
 }
 
@@ -686,7 +686,7 @@ void aes67_rx_stop(aes67_rx_t *rx)
 {
     if (!rx->have_thread)
         return;
-    atomic_store(&rx->running, 0);
+    aes67_atomic_store(&rx->running, 0, AES67_MO_SEQ_CST);
 #if defined(_WIN32)
     WaitForSingleObject(rx->thread, INFINITE);
     CloseHandle(rx->thread);

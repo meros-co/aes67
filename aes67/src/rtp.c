@@ -91,33 +91,33 @@ size_t aes67_rtp_pack_l24(uint8_t *packet, size_t cap, const aes67_rtp_header_t 
 void aes67_ring_init(aes67_ring_t *r)
 {
     memset(r->samples, 0, sizeof r->samples);
-    atomic_store(&r->head_ts, 0);
-    atomic_store(&r->writes, 0);
-    atomic_store(&r->late_drops, 0);
+    aes67_atomic_store(&r->head_ts, 0, AES67_MO_SEQ_CST);
+    aes67_atomic_store(&r->writes, 0, AES67_MO_SEQ_CST);
+    aes67_atomic_store(&r->late_drops, 0, AES67_MO_SEQ_CST);
 }
 
 void aes67_ring_write(aes67_ring_t *r, uint32_t ts, int32_t sample)
 {
-    const uint32_t head = (uint32_t) atomic_load_explicit(&r->head_ts, memory_order_relaxed);
+    const uint32_t head = (uint32_t) aes67_atomic_load(&r->head_ts, AES67_MO_RELAXED);
     /* Older than the whole ring behind the head: the reader may be on it. */
     if (head != 0 && (int32_t) (ts - head) < -(int32_t) AES67_RING_FRAMES) {
-        atomic_fetch_add_explicit(&r->late_drops, 1, memory_order_relaxed);
+        aes67_atomic_fetch_add(&r->late_drops, 1, AES67_MO_RELAXED);
         return;
     }
     r->samples[ts & RING_MASK] = sample;
-    atomic_fetch_add_explicit(&r->writes, 1, memory_order_relaxed);
+    aes67_atomic_fetch_add(&r->writes, 1, AES67_MO_RELAXED);
     /* An empty ring (head 0) takes whatever timestamp comes first. Senders
        start RTP timestamps at random (GStreamer, most devices); half of
        them are past 2^31, where the signed comparison below would call the
        very first frame "older than the head" and the ring would never
        prime -- a stream heard by the stats and never by the graph. */
     if (head == 0 || (int32_t) (ts + 1 - head) > 0)
-        atomic_store_explicit(&r->head_ts, (uint64_t) (ts + 1), memory_order_release);
+        aes67_atomic_store(&r->head_ts, (uint64_t) (ts + 1), AES67_MO_RELEASE);
 }
 
 int aes67_ring_read(const aes67_ring_t *r, uint32_t ts, int32_t *out, int frames)
 {
-    const uint32_t head = (uint32_t) atomic_load_explicit(&r->head_ts, memory_order_acquire);
+    const uint32_t head = (uint32_t) aes67_atomic_load(&r->head_ts, AES67_MO_ACQUIRE);
     int have = 0;
     for (int f = 0; f < frames; ++f) {
         const uint32_t t = ts + (uint32_t) f;
@@ -134,7 +134,7 @@ int aes67_ring_read(const aes67_ring_t *r, uint32_t ts, int32_t *out, int frames
 
 uint32_t aes67_ring_head(const aes67_ring_t *r)
 {
-    return (uint32_t) atomic_load_explicit(&r->head_ts, memory_order_acquire);
+    return (uint32_t) aes67_atomic_load(&r->head_ts, AES67_MO_ACQUIRE);
 }
 
 /* ---- SDP ------------------------------------------------------------------ */

@@ -41,4 +41,12 @@ if(BUILD_TESTING)
         target_compile_definitions(test_aes67 PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
     add_test(NAME aes67 COMMAND test_aes67)
+
+    # The headers from C++, before the standard library's: include order must
+    # not matter to a C++ consumer.
+    enable_language(CXX)
+    add_executable(test_aes67_cpp tests/test_cpp_include.cpp)
+    target_link_libraries(test_aes67_cpp PRIVATE meros_aes67)
+    set_target_properties(test_aes67_cpp PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME aes67_cpp COMMAND test_aes67_cpp)
 endif()

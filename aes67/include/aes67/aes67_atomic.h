@@ -4,134 +4,116 @@
 #ifndef MANIFOLD_AES67_ATOMIC_H
 #define MANIFOLD_AES67_ATOMIC_H
 
-/* Portable subset of C11 <stdatomic.h> for libaes67's playout rings.
+/* The atomics libaes67's rings and receivers use, under names of its own.
  *
- * The same policy as librecord's rec_atomic.h, kept as its own copy rather
- * than a cross-library include: a platform library is consumed on its own by
- * device firmware, and a ring's atomics are not something to reach into
- * another library for.
+ * Only what they need: 64-bit loads and stores with an order, fetch-add and
+ * exchange. Everything is a 64-bit slot, so one struct layout serves every
+ * compiler: a 32-bit timestamp in a 64-bit atomic costs nothing.
  *
- *  - MSVC always takes the fallback. Newer MSVC ships <stdatomic.h> but it
- *    hard-errors without /experimental:c11atomics, so probing for the header
- *    is not a usable test there.
- *  - C++ never uses <stdatomic.h> either (`_Atomic` is not a C++ keyword);
- *    GCC/Clang in C++ mode get the compiler's own builtins.
- *  - Everywhere else, real C11 atomics.
+ * Nothing here is spelled like the standard: no `atomic_store`, no
+ * `memory_order`, no `_Atomic` macro. A header that defined those would break
+ * C++ standard headers included after it (<atomic> and <memory> declare
+ * functions of the same names), so the order of includes would matter. These
+ * names are libaes67's and collide with nothing.
  *
- * Only what the rings need: aligned 32/64-bit loads and stores, fetch-add and
- * exchange on counters and flags. */
+ *  - C11 compilers with <stdatomic.h> (GCC, Clang): the real thing.
+ *  - C++ on GCC/Clang, and C without <stdatomic.h>: the compiler's __atomic
+ *    builtins, which give the same orders.
+ *  - MSVC, C or C++: <stdatomic.h> there needs /experimental:c11atomics, so it
+ *    is not used. x64 is TSO: a plain load is an acquire and a plain store a
+ *    release once the compiler is kept from reordering them. ARM64 is not:
+ *    loads use LDAR and stores STLR (`__ldar64`, `__stlr64`), because
+ *    `volatile` alone orders nothing there (MSVC's ARM64 default is
+ *    /volatile:iso). Read-modify-writes are Interlocked, a full barrier on
+ *    both. */
 
-#if !defined(_MSC_VER) && !defined(__cplusplus)
-#  if defined(__has_include)
-#    if __has_include(<stdatomic.h>)
-#      define AES67_HAVE_STDATOMIC 1
-#    endif
-#  else
-#    define AES67_HAVE_STDATOMIC 1
+#include <stdint.h>
+
+/* The same numbers as GCC's __ATOMIC_* and C11's memory_order_*. */
+#define AES67_MO_RELAXED 0
+#define AES67_MO_ACQUIRE 2
+#define AES67_MO_RELEASE 3
+#define AES67_MO_SEQ_CST 5
+
+#if !defined(_MSC_VER) && !defined(__cplusplus) && defined(__has_include)
+#  if __has_include(<stdatomic.h>)
+#    define AES67_ATOMIC_C11 1
 #  endif
+#elif !defined(_MSC_VER) && !defined(__cplusplus) && defined(__STDC_VERSION__) && !defined(__STDC_NO_ATOMICS__)
+#  define AES67_ATOMIC_C11 1
 #endif
 
-#if defined(__cplusplus) && !defined(_MSC_VER)
-#  define AES67_CPP_BUILTIN_ATOMICS 1
-#endif
-
-#if defined(AES67_HAVE_STDATOMIC)
+#if defined(AES67_ATOMIC_C11) /* ---- C11 ------------------------------------- */
 
 #include <stdatomic.h>
 
-#elif defined(MANIFOLD_RECORD_REC_ATOMIC_H) /* ---- librecord's shim is here first -- */
+typedef _Atomic uint64_t aes67_atomic_u64;
 
-/* The same fallback, already defined by librecord's rec_atomic.h in this
-   translation unit (the engine includes both). Two identical copies of a
-   typedef are still two typedefs, so this one steps aside. */
+#define aes67_atomic_load(p, mo)          atomic_load_explicit((p), (memory_order) (mo))
+#define aes67_atomic_store(p, v, mo)      atomic_store_explicit((p), (uint64_t) (v), (memory_order) (mo))
+#define aes67_atomic_fetch_add(p, v, mo)  atomic_fetch_add_explicit((p), (uint64_t) (v), (memory_order) (mo))
+#define aes67_atomic_exchange(p, v)       atomic_exchange((p), (uint64_t) (v))
 
-#elif defined(AES67_CPP_BUILTIN_ATOMICS) /* ---- C++ on GCC/Clang ---------- */
+#elif defined(__GNUC__) || defined(__clang__) /* ---- __atomic builtins ------- */
 
-#include <stddef.h>
-#include <stdint.h>
+/* Same size and alignment as C11's _Atomic uint64_t on every target these
+   compilers serve, so a ring is one layout whichever side declares it. */
+typedef volatile uint64_t aes67_atomic_u64;
 
-#define _Atomic volatile
+#define aes67_atomic_load(p, mo)          __atomic_load_n((p), (mo))
+#define aes67_atomic_store(p, v, mo)      __atomic_store_n((p), (uint64_t) (v), (mo))
+#define aes67_atomic_fetch_add(p, v, mo)  __atomic_fetch_add((p), (uint64_t) (v), (mo))
+#define aes67_atomic_exchange(p, v)       __atomic_exchange_n((p), (uint64_t) (v), __ATOMIC_SEQ_CST)
 
-typedef enum {
-    memory_order_relaxed = __ATOMIC_RELAXED,
-    memory_order_consume = __ATOMIC_CONSUME,
-    memory_order_acquire = __ATOMIC_ACQUIRE,
-    memory_order_release = __ATOMIC_RELEASE,
-    memory_order_acq_rel = __ATOMIC_ACQ_REL,
-    memory_order_seq_cst = __ATOMIC_SEQ_CST
-} memory_order;
-
-#define atomic_store(p, v)                  __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
-#define atomic_load(p)                      __atomic_load_n((p), __ATOMIC_SEQ_CST)
-#define atomic_load_explicit(p, mo)         __atomic_load_n((p), (mo))
-#define atomic_store_explicit(p, v, mo)     __atomic_store_n((p), (v), (mo))
-#define atomic_fetch_add_explicit(p, v, mo) __atomic_fetch_add((p), (v), (mo))
-#define atomic_exchange(p, v)               __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
-
-#else /* ---- MSVC fallback ------------------------------------------------ */
+#elif defined(_MSC_VER) /* ---- MSVC -------------------------------------------- */
 
 #include <intrin.h>
-#include <stddef.h>
-#include <stdint.h>
 
 #if !defined(_M_X64) && !defined(_M_ARM64)
-#  error "libaes67's MSVC atomics fallback requires a 64-bit target"
+#  error "libaes67's MSVC atomics need x64 or ARM64"
 #endif
 
-/* No _Atomic qualifier on MSVC; volatile plus explicit barriers gives the
-   ordering an SPSC ring needs on x64/arm64 under the MSVC memory model.
-   Everything is widened to 64 bits: the ring's 32-bit timestamps and the
-   running flag are stored in 64-bit slots for exactly this reason. */
-#define _Atomic volatile
-
-typedef enum {
-    memory_order_relaxed,
-    memory_order_consume,
-    memory_order_acquire,
-    memory_order_release,
-    memory_order_acq_rel,
-    memory_order_seq_cst
-} memory_order;
-
-static __forceinline long long aes67__atomic_load64(volatile long long *p)
-{
-    long long v = *p;
-    _ReadWriteBarrier();
-    return v;
-}
-
-static __forceinline void aes67__atomic_store64(volatile long long *p, long long v)
-{
-    _ReadWriteBarrier();
-    *p = v;
-}
-
-#define atomic_store(p, v)               aes67__atomic_store64((volatile long long *)(p), (long long)(v))
-#define atomic_load(p)                   aes67__atomic_load64((volatile long long *)(p))
-#define atomic_load_explicit(p, mo)      ((mo), aes67__atomic_load64((volatile long long *)(p)))
-#define atomic_store_explicit(p, v, mo)  ((mo), aes67__atomic_store64((volatile long long *)(p), (long long)(v)))
-#define atomic_fetch_add_explicit(p, v, mo) \
-    ((mo), (unsigned long long) _InterlockedExchangeAdd64((volatile long long *)(p), (long long)(v)))
-#define atomic_exchange(p, v) \
-    ((unsigned long long) _InterlockedExchange64((volatile long long *)(p), (long long)(v)))
-
-#endif
-
-#if !defined(AES67_HAVE_STDATOMIC) && !defined(atomic_exchange)
-#  if defined(_MSC_VER)
-#    define atomic_exchange(p, v)         ((unsigned long long) _InterlockedExchange64((volatile long long *)(p), (long long)(v)))
-#  else
-#    define atomic_exchange(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
-#  endif
-#endif
-
-/* The ring's atomics are declared through this so the MSVC fallback's 64-bit
-   widening is the same on every platform: a 32-bit timestamp in a 64-bit
-   atomic costs nothing and means one struct layout everywhere. */
-#if defined(AES67_HAVE_STDATOMIC) || defined(AES67_CPP_BUILTIN_ATOMICS)
-typedef _Atomic uint64_t aes67_atomic_u64;
-#else
 typedef volatile long long aes67_atomic_u64;
+
+static __forceinline uint64_t aes67__msvc_load(const volatile long long *p, int mo)
+{
+#if defined(_M_ARM64)
+    if (mo == AES67_MO_RELAXED)
+        return (uint64_t) __iso_volatile_load64((const volatile __int64 *) p);
+    return (uint64_t) __ldar64((const volatile unsigned __int64 *) p);
+#else
+    long long v;
+    (void) mo;
+    v = *p;
+    _ReadWriteBarrier();
+    return (uint64_t) v;
+#endif
+}
+
+static __forceinline void aes67__msvc_store(volatile long long *p, uint64_t v, int mo)
+{
+    if (mo == AES67_MO_SEQ_CST) {
+        _InterlockedExchange64(p, (long long) v);   /* the store-load fence seq_cst needs */
+        return;
+    }
+#if defined(_M_ARM64)
+    if (mo == AES67_MO_RELAXED)
+        __iso_volatile_store64((volatile __int64 *) p, (__int64) v);
+    else
+        __stlr64((volatile unsigned __int64 *) p, (unsigned __int64) v);
+#else
+    _ReadWriteBarrier();
+    *p = (long long) v;
+#endif
+}
+
+#define aes67_atomic_load(p, mo)          aes67__msvc_load((p), (mo))
+#define aes67_atomic_store(p, v, mo)      aes67__msvc_store((p), (uint64_t) (v), (mo))
+#define aes67_atomic_fetch_add(p, v, mo)  ((void) (mo), (uint64_t) _InterlockedExchangeAdd64((p), (long long) (v)))
+#define aes67_atomic_exchange(p, v)       ((uint64_t) _InterlockedExchange64((p), (long long) (v)))
+
+#else
+#  error "libaes67 needs C11 atomics, GCC/Clang builtins or MSVC"
 #endif
 
 #endif /* MANIFOLD_AES67_ATOMIC_H */

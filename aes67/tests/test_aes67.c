@@ -107,7 +107,7 @@ static void test_ring_is_timestamp_indexed(void)
     /* Older than a whole ring behind the head: dropped, not written over
        what the reader is about to play. */
     aes67_ring_write(&r, 1008 - AES67_RING_FRAMES - 1, 99);
-    CHECK((uint32_t) atomic_load(&r.late_drops) == 1);
+    CHECK((uint32_t) aes67_atomic_load(&r.late_drops, AES67_MO_SEQ_CST) == 1);
 
     /* Timestamps wrap at 2^32 and the ring does not care. */
     aes67_ring_init(&r);
