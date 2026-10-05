@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aes67/netrx.h"
 #include "aes67/rtp.h"
 #include "aes67/rx.h"
 #include "aes67/sdp.h"
@@ -214,6 +215,184 @@ static void test_packets_into_the_callers_rings(void)
     CHECK(aes67_rtp_write_rings(l16, sizeof l16, 97, AES67_FORMAT_L16, 1, 20, rings, NULL) == 2);
     CHECK(aes67_ring_read(&rings[0], (uint32_t) -10, out, 2) == 2 && out[0] == 256 * 256 && out[1] == -256);
     free(rings);
+}
+
+static uint32_t ip4(const char *s)
+{
+    uint32_t v = 0;
+    aes67_parse_ipv4(s, &v);
+    return v;
+}
+
+static aes67_ring_t *new_rings(int n)
+{
+    aes67_ring_t *r = (aes67_ring_t *) calloc((size_t) n, sizeof *r);
+    for (int i = 0; r != NULL && i < n; ++i)
+        aes67_ring_init(&r[i]);
+    return r;
+}
+
+/* The caller-owned receiver: two streams on one port told apart by
+   destination, a third by its source; loss, reordering and a wrong payload
+   type counted; a removed stream no longer written. */
+static void test_netrx_sorts_one_port(void)
+{
+    char err[128] = { 0 };
+    aes67_netrx_t *rx = aes67_netrx_open(NULL, err, sizeof err);
+    CHECK(rx != NULL);
+    if (rx == NULL)
+        return;
+    aes67_ring_t *a = new_rings(2), *b = new_rings(1), *c = new_rings(1);
+
+    aes67_netrx_stream_cfg_t ca;
+    memset(&ca, 0, sizeof ca);
+    ca.group = ip4("239.69.1.1");
+    ca.port = 5004;
+    ca.payload_type = 96;
+    ca.channels = 2;
+    ca.media_clock_offset = 1000;
+    ca.rings = a;
+    aes67_netrx_stream_cfg_t cb = ca;
+    cb.group = ip4("239.69.1.2");
+    cb.channels = 1;
+    cb.media_clock_offset = 0;
+    cb.rings = b;
+    aes67_netrx_stream_cfg_t cc = cb;
+    cc.group = ip4("232.1.1.1");
+    cc.source = ip4("192.168.1.20");
+    cc.rings = c;
+
+    const int sa = aes67_netrx_add_stream(rx, &ca, err, sizeof err);
+    const int sb = sa >= 0 ? aes67_netrx_add_stream(rx, &cb, err, sizeof err) : -1;
+    const int sc = sb >= 0 ? aes67_netrx_add_stream(rx, &cc, err, sizeof err) : -1;
+    if (sa < 0 || sb < 0 || sc < 0) {
+        printf("  netrx sorting skipped: %s (no multicast here?)\n", err);
+        aes67_netrx_close(rx);
+        free(a); free(b); free(c);
+        return;
+    }
+    CHECK(aes67_netrx_add_stream(rx, &cb, err, sizeof err) < 0);    /* the same stream twice */
+
+    uint8_t pkt[1500];
+    const uint32_t src = ip4("192.168.1.10");
+    size_t n = build_packet(pkt, sizeof pkt, 96, 1, 5000, 2, 2, 100);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 1);
+    n = build_packet(pkt, sizeof pkt, 96, 7, 9000, 2, 1, 40);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.2"), 5004, pkt, n, 2);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.2"), 5006, pkt, n, 3);       /* same group, other port: nobody's */
+    n = build_packet(pkt, sizeof pkt, 96, 1, 77, 1, 1, 9);
+    aes67_netrx_inject(rx, src, ip4("232.1.1.1"), 5004, pkt, n, 4);        /* SSM, wrong source */
+    aes67_netrx_inject(rx, ip4("192.168.1.20"), ip4("232.1.1.1"), 5004, pkt, n, 5);
+
+    int32_t out[2];
+    /* Indexed by the media clock: RTP 5000 less the offset of 1000. */
+    CHECK(aes67_ring_read(&a[0], 4000, out, 2) == 2 && out[0] == 100 && out[1] == 110);
+    CHECK(aes67_ring_read(&a[1], 4000, out, 2) == 2 && out[0] == 101);
+    CHECK(aes67_ring_read(&b[0], 9000, out, 2) == 2 && out[1] == 50);
+    CHECK(aes67_ring_read(&c[0], 77, out, 1) == 1 && out[0] == 9);
+    aes67_netrx_stats_t st;
+    aes67_netrx_get_stats(rx, sb, &st);
+    CHECK(st.packets == 1 && st.last_seq_valid && st.last_seq == 7);
+    aes67_netrx_get_stats(rx, sc, &st);
+    CHECK(st.packets == 1);
+    CHECK(aes67_netrx_foreign_packets(rx) == 2);
+
+    n = build_packet(pkt, sizeof pkt, 96, 4, 5012, 2, 2, 1);               /* 2 and 3 missing */
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 10);
+    n = build_packet(pkt, sizeof pkt, 96, 2, 5004, 2, 2, 2);               /* late */
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 11);
+    n = build_packet(pkt, sizeof pkt, 97, 5, 5016, 1, 2, 3);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 12);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, 5, 13);
+    aes67_netrx_get_stats(rx, sa, &st);
+    CHECK(st.packets == 3 && st.lost == 2 && st.reordered == 1 && st.wrong_pt == 1 && st.malformed == 1);
+    CHECK(aes67_ring_read(&a[0], 4004, out, 1) == 1 && out[0] == 2);       /* the late one still landed */
+
+    aes67_netrx_remove_stream(rx, sb);
+    n = build_packet(pkt, sizeof pkt, 96, 8, 9002, 1, 1, 50);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.2"), 5004, pkt, n, 14);
+    CHECK(aes67_ring_read(&b[0], 9002, out, 1) == 0);
+    CHECK(aes67_netrx_add_stream(rx, &cb, err, sizeof err) >= 0);          /* and it can come back */
+
+    aes67_netrx_close(rx);
+    free(a); free(b); free(c);
+}
+
+/* Real datagrams through the sockets on loopback: two streams on one port,
+   started, then one removed while the thread runs. */
+static void test_netrx_from_the_wire_if_possible(void)
+{
+    char err[128] = { 0 };
+    aes67_netrx_t *rx = aes67_netrx_open("127.0.0.1", err, sizeof err);
+    CHECK(rx != NULL);
+    if (rx == NULL)
+        return;
+    aes67_ring_t *r1 = new_rings(1), *r2 = new_rings(1);
+    aes67_netrx_stream_cfg_t c1;
+    memset(&c1, 0, sizeof c1);
+    c1.group = ip4("239.69.200.1");
+    c1.port = 15004;
+    c1.payload_type = 98;
+    c1.channels = 1;
+    c1.rings = r1;
+    aes67_netrx_stream_cfg_t c2 = c1;
+    c2.group = ip4("239.69.200.2");
+    c2.rings = r2;
+    const int s1 = aes67_netrx_add_stream(rx, &c1, err, sizeof err);
+    const int s2 = s1 >= 0 ? aes67_netrx_add_stream(rx, &c2, err, sizeof err) : -1;
+
+    aes67_tx_cfg_t tcfg;
+    memset(&tcfg, 0, sizeof tcfg);
+    tcfg.stream_count = 2;
+    strcpy(tcfg.iface_ip, "127.0.0.1");
+    for (int i = 0; i < 2; ++i) {
+        strcpy(tcfg.streams[i].group, i == 0 ? "239.69.200.1" : "239.69.200.2");
+        tcfg.streams[i].port = 15004;
+        tcfg.streams[i].payload_type = 98;
+        tcfg.streams[i].channels = 1;
+        tcfg.streams[i].ptime_us = 1000;
+    }
+    aes67_tx_t *tx = s2 >= 0 ? aes67_tx_open(&tcfg, err, sizeof err) : NULL;
+    if (tx == NULL) {
+        printf("  netrx from the wire skipped: %s\n", err);
+        aes67_netrx_close(rx);
+        free(r1); free(r2);
+        return;
+    }
+    CHECK(aes67_netrx_start(rx));
+    int32_t frames[48];
+    for (int p = 0; p < 20; ++p) {
+        for (int i = 0; i < 48; ++i) frames[i] = 1000 + p;
+        aes67_tx_send(tx, 0, frames, 48, (uint32_t) p * 48);
+        for (int i = 0; i < 48; ++i) frames[i] = -1000 - p;
+        aes67_tx_send(tx, 1, frames, 48, (uint32_t) p * 48);
+        sleep_ms(1);
+    }
+    aes67_netrx_stats_t a1, a2;
+    memset(&a1, 0, sizeof a1);
+    memset(&a2, 0, sizeof a2);
+    for (int tries = 0; tries < 200 && (a1.packets < 20 || a2.packets < 20); ++tries) {
+        sleep_ms(10);
+        aes67_netrx_get_stats(rx, s1, &a1);
+        aes67_netrx_get_stats(rx, s2, &a2);
+    }
+    if (a1.packets == 0 && a2.packets == 0) {
+        printf("  netrx from the wire skipped: multicast loopback not delivered\n");
+    } else {
+        CHECK(a1.packets == 20 && a2.packets == 20 && a1.lost == 0);
+        int32_t v = 0;
+        CHECK(aes67_ring_read(&r1[0], 48 * 19, &v, 1) == 1 && v == 1019);
+        CHECK(aes67_ring_read(&r2[0], 48 * 19, &v, 1) == 1 && v == -1019);
+        /* Removed while running: the thread lets go of its rings. */
+        aes67_netrx_remove_stream(rx, s2);
+        for (int i = 0; i < 48; ++i) frames[i] = 7;
+        aes67_tx_send(tx, 1, frames, 48, 48 * 20);
+        sleep_ms(50);
+        CHECK(aes67_ring_read(&r2[0], 48 * 20, &v, 1) == 0);
+    }
+    aes67_tx_close(tx);
+    aes67_netrx_close(rx);
+    free(r1); free(r2);
 }
 
 static void test_receive_path_end_to_end(void)
@@ -931,6 +1110,8 @@ int main(void)
     test_ring_is_timestamp_indexed();
     test_sdp_says_what_a_receiver_needs();
     test_packets_into_the_callers_rings();
+    test_netrx_sorts_one_port();
+    test_netrx_from_the_wire_if_possible();
     test_receive_path_end_to_end();
     test_transmit_builds_what_receive_reads();
     test_socket_round_trip_if_possible();

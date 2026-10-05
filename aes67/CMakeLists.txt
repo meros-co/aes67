@@ -12,6 +12,7 @@ add_library(meros_aes67 STATIC
     src/rtp.c
     src/sdp.c
     src/rx.c
+    src/netrx.c
     src/tx.c
 )
 add_library(meros::aes67 ALIAS meros_aes67)
@@ -27,7 +28,7 @@ if(MSVC)
     target_compile_definitions(meros_aes67 PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 if(WIN32)
-    target_link_libraries(meros_aes67 PUBLIC ws2_32)
+    target_link_libraries(meros_aes67 PUBLIC ws2_32 avrt)   # avrt: MMCSS for the receive thread
 else()
     target_compile_options(meros_aes67 PRIVATE -Wall -Wextra)
     find_package(Threads REQUIRED)
