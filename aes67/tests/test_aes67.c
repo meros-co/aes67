@@ -464,6 +464,102 @@ static const char kRavennaSdp[] =
     "a=ts-refclk:ptp=IEEE1588-2008:00-1D-C1-FF-FE-AB-CD-EF:0\r\n"
     "a=recvonly\r\n";
 
+/* Real AES67 sends every stream to 5004 and tells them apart by group. Two
+   receivers in one process, three streams on one port: each stream gets its
+   own packets and nothing else -- on Windows and macOS by the destination
+   address the socket reports, on Linux by binding each socket to its group. */
+static void test_streams_share_one_port_if_possible(void)
+{
+    static const char *groups[3] = { "239.69.7.8", "239.69.7.9", "239.69.7.10" };
+    aes67_rx_cfg_t a;
+    memset(&a, 0, sizeof a);
+    a.stream_count = 2;
+    a.cpu = -1;
+    a.shared_port = true;
+    strcpy(a.iface_ip, "127.0.0.1");
+    for (int i = 0; i < 2; ++i) {
+        strcpy(a.streams[i].group, groups[i]);
+        a.streams[i].port = 5108;
+        a.streams[i].payload_type = 98;
+        a.streams[i].channels = 2;
+        a.streams[i].first_channel = i * 2;
+    }
+    aes67_rx_cfg_t b = a;
+    b.stream_count = 1;
+    strcpy(b.streams[0].group, groups[2]);
+    b.streams[0].first_channel = 0;
+
+    aes67_tx_cfg_t tcfg;
+    memset(&tcfg, 0, sizeof tcfg);
+    tcfg.stream_count = 3;
+    strcpy(tcfg.iface_ip, "127.0.0.1");
+    for (int i = 0; i < 3; ++i) {
+        strcpy(tcfg.streams[i].group, groups[i]);
+        tcfg.streams[i].port = 5108;
+        tcfg.streams[i].payload_type = 98;
+        tcfg.streams[i].channels = 2;
+        tcfg.streams[i].ptime_us = 1000;
+    }
+
+    char err[128] = { 0 };
+    aes67_rx_t *rxa = aes67_rx_open(&a, err, sizeof err);
+    aes67_rx_t *rxb = rxa ? aes67_rx_open(&b, err, sizeof err) : NULL;
+    aes67_tx_t *tx = rxb ? aes67_tx_open(&tcfg, err, sizeof err) : NULL;
+    if (tx == NULL) {
+        printf("  shared port skipped: %s\n", err);
+        if (rxb) aes67_rx_close(rxb);
+        if (rxa) aes67_rx_close(rxa);
+        return;
+    }
+    CHECK(aes67_rx_start(rxa));
+    CHECK(aes67_rx_start(rxb));
+
+    int32_t frames[48 * 2];
+    for (int p = 0; p < 20; ++p)
+        for (int k = 0; k < 3; ++k) {
+            for (int i = 0; i < 96; ++i)
+                frames[i] = (k + 1) * 100000 + i;
+            aes67_tx_send(tx, k, frames, 48, 960000 + (uint32_t) p * 48);
+            if (k == 2)
+                sleep_ms(1);
+        }
+
+    aes67_rx_stream_stats_t s0, s1, s2;
+    memset(&s0, 0, sizeof s0);
+    memset(&s1, 0, sizeof s1);
+    memset(&s2, 0, sizeof s2);
+    for (int tries = 0; tries < 100 && (s0.packets < 20 || s1.packets < 20 || s2.packets < 20); ++tries) {
+        sleep_ms(10);
+        aes67_rx_get_stats(rxa, 0, &s0);
+        aes67_rx_get_stats(rxa, 1, &s1);
+        aes67_rx_get_stats(rxb, 0, &s2);
+    }
+    if (s0.packets == 0 && s1.packets == 0 && s2.packets == 0) {
+        printf("  shared port skipped: multicast loopback not delivered\n");
+    } else {
+        /* Exactly its own twenty each: a stream fed another's packets would
+           count them (and the samples below would be the other's). */
+        CHECK(s0.packets == 20);
+        CHECK(s1.packets == 20);
+        CHECK(s2.packets == 20);
+        int32_t out[48];
+        CHECK(aes67_rx_read(rxa, 0, 960000, out, 48) == 48);
+        CHECK(out[0] == 100000);
+        CHECK(aes67_rx_read(rxa, 2, 960000, out, 48) == 48);
+        CHECK(out[0] == 200000);
+        CHECK(aes67_rx_read(rxb, 1, 960000, out, 48) == 48);
+        CHECK(out[0] == 300001);
+        printf("  shared port: %llu + %llu packets for other receivers dropped\n",
+               (unsigned long long) aes67_rx_foreign_packets(rxa),
+               (unsigned long long) aes67_rx_foreign_packets(rxb));
+    }
+    aes67_rx_stop(rxb);
+    aes67_rx_stop(rxa);
+    aes67_tx_close(tx);
+    aes67_rx_close(rxb);
+    aes67_rx_close(rxa);
+}
+
 static void test_sdp_parses_the_common_forms(void)
 {
     aes67_sdp_t s;
@@ -796,6 +892,7 @@ int main(void)
     test_receive_path_end_to_end();
     test_transmit_builds_what_receive_reads();
     test_socket_round_trip_if_possible();
+    test_streams_share_one_port_if_possible();
     test_sdp_parses_the_common_forms();
     test_sdp_refuses_only_what_it_must();
     test_grandmaster_agreement_is_strict();

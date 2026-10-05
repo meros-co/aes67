@@ -4,8 +4,9 @@ Two small, portable C11 libraries for audio-over-IP devices:
 
 - **`aes67/`** (`meros::aes67`): AES67 / SMPTE ST 2110-30 RTP receive and transmit, L16/L24 framing,
   a timestamp-indexed playout ring, SDP generation and parsing, and SAP announcement. On Linux, receive
-  uses `recvmmsg`, `epoll` and kernel timestamps. Elsewhere, each stream has its own socket and is read
-  with `poll`.
+  uses `recvmmsg`, `epoll` and kernel timestamps. On Windows and macOS, every stream on a port shares one
+  socket, and each packet is sorted to its stream by destination address. That way all streams can use
+  5004, as real AES67 does.
 - **`mdns/`** (`meros::mdns`): DNS-SD over multicast DNS, the device's half. It announces the device's
   own services (for example `_nmos-node._tcp`) and browses for others (`_nmos-register._tcp`) with one
   socket and no system daemon.

@@ -15,9 +15,11 @@
  *  - Linux: recvmmsg batches, epoll, SO_TIMESTAMPNS for arrival jitter,
  *    optional SO_BUSY_POLL and CPU pinning. This is the appliance path, and
  *    it is the one the receive benchmarks were measured on.
- *  - Everything else (Windows dev builds, macOS): poll + recvfrom, one packet
- *    at a time, arrival stamped with the monotonic clock. Correct and plenty
- *    for a developer's desk; not the path a show runs on.
+ *  - Everything else (Windows, macOS): one socket per port with every
+ *    stream's group joined on it, poll + recvmsg one packet at a time, each
+ *    packet sorted to its stream by its destination address (IP_PKTINFO, or
+ *    IP_RECVDSTADDR on BSD), arrival stamped with the monotonic clock. So
+ *    every stream can share 5004, as real AES67 does.
  */
 
 #include <stdbool.h>
@@ -65,7 +67,9 @@ typedef struct aes67_rx_cfg {
     int                   cpu;            /* pin the receive thread; -1 = do not */
     bool                  busy_poll;      /* SO_BUSY_POLL escalation (Linux) */
     int                   busy_poll_us;
-    bool                  shared_port;    /* bind each socket to its group: one port for all (real AES67) */
+    bool                  shared_port;    /* Linux: bind each socket to its group, one port for all (real AES67).
+                                             Windows and macOS always share the port: one socket per port, each
+                                             packet sorted to its stream by destination address. */
 } aes67_rx_cfg_t;
 
 typedef struct aes67_rx_stream_stats {
@@ -94,6 +98,10 @@ int aes67_rx_read(aes67_rx_t *rx, int channel, uint32_t ts, int32_t *out, int fr
 uint32_t aes67_rx_playout_ts(aes67_rx_t *rx, int stream, uint32_t margin_frames);
 
 void aes67_rx_get_stats(aes67_rx_t *rx, int stream, aes67_rx_stream_stats_t *out);
+/* Packets that reached this receiver's sockets for a group none of its
+   streams joined -- another receiver's on the same port -- and were dropped.
+   Always 0 on Linux, where each socket is bound to its own group. */
+uint64_t aes67_rx_foreign_packets(aes67_rx_t *rx);
 void aes67_rx_stop(aes67_rx_t *rx);
 void aes67_rx_close(aes67_rx_t *rx);
 

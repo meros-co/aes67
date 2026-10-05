@@ -4,7 +4,17 @@
 /* libaes67 receive. See rx.h.
  *
  * The packet path (aes67_rx_inject and below) is shared by both socket
- * paths and by the tests; only how packets get off the wire differs. */
+ * paths and by the tests; only how packets get off the wire differs.
+ *
+ * Real AES67 puts every stream on one port (5004) and tells them apart by
+ * multicast group. Linux binds a socket to each group, which does the
+ * sorting in the kernel. Windows cannot bind a multicast address, and a
+ * socket bound to the port receives every group joined on it (macOS is no
+ * better with several streams on one socket), so there the receiver opens
+ * one socket per port, joins every stream's group on it, and sorts each
+ * packet by the destination address the kernel reports with it (IP_PKTINFO;
+ * IP_RECVDSTADDR on BSD). A packet for a group no stream here asked for --
+ * another receiver's, on the same port -- is dropped and counted. */
 
 #if defined(__linux__)
 #  define _GNU_SOURCE
@@ -20,6 +30,7 @@
 #if defined(_WIN32)
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <mswsock.h>
 #  include <windows.h>
 #  include <process.h>
    typedef SOCKET aes67_sock_t;
@@ -33,6 +44,7 @@
 #  include <pthread.h>
 #  include <sched.h>
 #  include <sys/socket.h>
+#  include <sys/uio.h>
 #  include <time.h>
 #  include <unistd.h>
 #  if defined(__linux__)
@@ -52,6 +64,8 @@
 typedef struct aes67_rx_stream {
     aes67_rx_stream_cfg_t   cfg;
     aes67_sock_t            fd;
+    int                     sock;          /* index into rx->socks (not Linux) */
+    uint32_t                group_addr;    /* the group, network order */
     uint16_t                last_seq;
     bool                    have_seq;
     uint64_t                last_arr_ns;
@@ -65,6 +79,15 @@ struct aes67_rx {
     int               ring_count;
 #if defined(__linux__)
     int               epfd;
+#else
+    /* One socket per port; streams on that port share it (see the top). */
+    aes67_sock_t      socks[AES67_RX_MAX_STREAMS];
+    uint16_t          sock_port[AES67_RX_MAX_STREAMS];
+    int               sock_count;
+    aes67_atomic_u64  not_ours;     /* packets for a group no stream here joined */
+#  if defined(_WIN32)
+    LPFN_WSARECVMSG   wsa_recvmsg;
+#  endif
 #endif
     aes67_thread_t    thread;
     bool              have_thread;
@@ -177,6 +200,7 @@ static bool set_nonblocking(aes67_sock_t fd)
 #endif
 }
 
+#if defined(__linux__)
 static aes67_sock_t open_stream_socket(const aes67_rx_cfg_t *cfg, const aes67_rx_stream_cfg_t *sc,
                                        char *errbuf, size_t errlen)
 {
@@ -206,13 +230,8 @@ static aes67_sock_t open_stream_socket(const aes67_rx_cfg_t *cfg, const aes67_rx
     addr.sin_family = AF_INET;
     addr.sin_port = htons(sc->port);
     /* Bound to the group itself, one shared port demuxes by destination --
-       the real AES67 convention (everything on 5004). Windows cannot bind a
-       multicast address, so there every stream needs its own port. */
-#if defined(_WIN32)
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-#else
+       the real AES67 convention (everything on 5004). */
     addr.sin_addr.s_addr = cfg->shared_port ? inet_addr(sc->group) : htonl(INADDR_ANY);
-#endif
     if (bind(fd, (struct sockaddr *) &addr, sizeof addr) < 0) {
         snprintf(errbuf, errlen, "bind %s:%u: error %d", sc->group, sc->port, aes67_sockerr());
         aes67_closesock(fd);
@@ -230,6 +249,7 @@ static aes67_sock_t open_stream_socket(const aes67_rx_cfg_t *cfg, const aes67_rx
     }
     return fd;
 }
+#endif
 
 /* ---- receive thread ---------------------------------------------------------- */
 
@@ -294,20 +314,157 @@ static void *rx_thread_main(void *arg)
     return NULL;
 }
 
-#else /* ---- portable: poll + recvfrom ------------------------------------ */
+#else /* ---- portable: one socket per port, sorted by destination ---------- */
 
-static void drain_stream(aes67_rx_t *rx, aes67_rx_stream_t *s)
+/* A socket for every stream on `port`: bound to any address on it, told to
+   report each packet's destination. */
+static aes67_sock_t open_port_socket(const aes67_rx_cfg_t *cfg, uint16_t port, char *errbuf, size_t errlen)
+{
+    (void) cfg;
+    aes67_sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == AES67_BAD_SOCK) {
+        snprintf(errbuf, errlen, "socket: error %d", aes67_sockerr());
+        return AES67_BAD_SOCK;
+    }
+    set_nonblocking(fd);
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
+#if defined(SO_REUSEPORT)
+    /* BSD: another socket (another receiver, another program) on the same
+       port needs it as well as SO_REUSEADDR. */
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *) &one, sizeof one);
+#endif
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *) &rcvbuf, sizeof rcvbuf);
+#if defined(_WIN32) || (defined(IP_PKTINFO) && !defined(IP_RECVDSTADDR))
+    if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, (const char *) &one, sizeof one) != 0) {
+        snprintf(errbuf, errlen, "IP_PKTINFO: error %d", aes67_sockerr());
+        aes67_closesock(fd);
+        return AES67_BAD_SOCK;
+    }
+#else
+    if (setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, (const char *) &one, sizeof one) != 0) {
+        snprintf(errbuf, errlen, "IP_RECVDSTADDR: error %d", aes67_sockerr());
+        aes67_closesock(fd);
+        return AES67_BAD_SOCK;
+    }
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *) &addr, sizeof addr) < 0) {
+        snprintf(errbuf, errlen, "bind port %u: error %d", port, aes67_sockerr());
+        aes67_closesock(fd);
+        return AES67_BAD_SOCK;
+    }
+    return fd;
+}
+
+static bool join_group(aes67_sock_t fd, const aes67_rx_cfg_t *cfg, const char *group, char *errbuf, size_t errlen)
+{
+    struct ip_mreq mreq;
+    memset(&mreq, 0, sizeof mreq);
+    mreq.imr_multiaddr.s_addr = inet_addr(group);
+    mreq.imr_interface.s_addr = cfg->iface_ip[0] ? inet_addr(cfg->iface_ip) : htonl(INADDR_ANY);
+    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq, sizeof mreq) < 0) {
+        snprintf(errbuf, errlen, "IP_ADD_MEMBERSHIP %s: error %d", group, aes67_sockerr());
+        return false;
+    }
+    return true;
+}
+
+/* One datagram and the address it was sent to (network order; 0 when the
+   kernel did not say). -1 when there is nothing to read. */
+static int recv_with_destination(aes67_rx_t *rx, aes67_sock_t fd, uint8_t *buf, size_t cap, uint32_t *dst)
+{
+    *dst = 0;
+#if defined(_WIN32)
+    char ctrl[128];
+    struct sockaddr_in from;
+    WSABUF wb;
+    wb.len = (ULONG) cap;
+    wb.buf = (CHAR *) buf;
+    WSAMSG msg;
+    memset(&msg, 0, sizeof msg);
+    msg.name = (LPSOCKADDR) &from;
+    msg.namelen = sizeof from;
+    msg.lpBuffers = &wb;
+    msg.dwBufferCount = 1;
+    msg.Control.buf = ctrl;
+    msg.Control.len = sizeof ctrl;
+    DWORD got = 0;
+    if (rx->wsa_recvmsg == NULL || rx->wsa_recvmsg(fd, &msg, &got, NULL, NULL) != 0)
+        return -1;
+    for (WSACMSGHDR *c = WSA_CMSG_FIRSTHDR(&msg); c != NULL; c = WSA_CMSG_NXTHDR(&msg, c))
+        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+            IN_PKTINFO pi;
+            memcpy(&pi, WSA_CMSG_DATA(c), sizeof pi);
+            *dst = pi.ipi_addr.s_addr;
+        }
+    return (int) got;
+#else
+    (void) rx;
+    union { char buf[128]; struct cmsghdr align; } ctrl;
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = cap;
+    struct msghdr mh;
+    memset(&mh, 0, sizeof mh);
+    mh.msg_iov = &iov;
+    mh.msg_iovlen = 1;
+    mh.msg_control = ctrl.buf;
+    mh.msg_controllen = sizeof ctrl.buf;
+    const ssize_t n = recvmsg(fd, &mh, MSG_DONTWAIT);
+    if (n <= 0)
+        return -1;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c != NULL; c = CMSG_NXTHDR(&mh, c)) {
+#  if defined(IP_RECVDSTADDR)
+        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVDSTADDR)
+            memcpy(dst, CMSG_DATA(c), sizeof *dst);
+#  else
+        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+            struct in_pktinfo pi;
+            memcpy(&pi, CMSG_DATA(c), sizeof pi);
+            *dst = pi.ipi_addr.s_addr;
+        }
+#  endif
+    }
+    return (int) n;
+#endif
+}
+
+static void drain_socket(aes67_rx_t *rx, int sock)
 {
     uint8_t buf[2048];
     for (int i = 0; i < BATCH; ++i) {
-#if defined(_WIN32)
-        const int n = recv(s->fd, (char *) buf, sizeof buf, 0);
-#else
-        const ssize_t n = recv(s->fd, buf, sizeof buf, MSG_DONTWAIT);
-#endif
+        uint32_t dst = 0;
+        const int n = recv_with_destination(rx, rx->socks[sock], buf, sizeof buf, &dst);
         if (n <= 0)
             return;
-        process_packet(rx, s, buf, (size_t) n, now_ns());
+        const uint64_t arrived = now_ns();
+        /* Every stream on this socket that the packet was addressed to (two
+           streams may read different channels of one group). Without a
+           destination, a socket with one group can still only mean it. */
+        int matched = 0, only = -1, groups = 0;
+        for (int k = 0; k < rx->cfg.stream_count; ++k) {
+            aes67_rx_stream_t *s = &rx->streams[k];
+            if (s->sock != sock)
+                continue;
+            if (only < 0 || rx->streams[only].group_addr != s->group_addr)
+                ++groups;
+            only = k;
+            if (dst != 0 && s->group_addr == dst) {
+                process_packet(rx, s, buf, (size_t) n, arrived);
+                ++matched;
+            }
+        }
+        if (matched == 0 && dst == 0 && groups == 1 && only >= 0)
+            process_packet(rx, &rx->streams[only], buf, (size_t) n, arrived);
+        else if (matched == 0)
+            atomic_fetch_add_explicit(&rx->not_ours, 1, memory_order_relaxed);
     }
 }
 
@@ -325,21 +482,21 @@ static void *rx_thread_main(void *arg)
     struct pollfd fds[AES67_RX_MAX_STREAMS];
 #endif
     while (atomic_load_explicit(&rx->running, memory_order_relaxed)) {
-        for (int i = 0; i < rx->cfg.stream_count; ++i) {
-            fds[i].fd = rx->streams[i].fd;
+        for (int i = 0; i < rx->sock_count; ++i) {
+            fds[i].fd = rx->socks[i];
             fds[i].events = POLLIN;
             fds[i].revents = 0;
         }
 #if defined(_WIN32)
-        const int n = WSAPoll(fds, (ULONG) rx->cfg.stream_count, 100);
+        const int n = WSAPoll(fds, (ULONG) rx->sock_count, 100);
 #else
-        const int n = poll(fds, (nfds_t) rx->cfg.stream_count, 100);
+        const int n = poll(fds, (nfds_t) rx->sock_count, 100);
 #endif
         if (n <= 0)
             continue;
-        for (int i = 0; i < rx->cfg.stream_count; ++i)
+        for (int i = 0; i < rx->sock_count; ++i)
             if (fds[i].revents & POLLIN)
-                drain_stream(rx, &rx->streams[i]);
+                drain_socket(rx, i);
     }
 #if defined(_WIN32)
     return 0;
@@ -364,8 +521,13 @@ aes67_rx_t *aes67_rx_open(const aes67_rx_cfg_t *cfg, char *errbuf, size_t errlen
         return NULL;
     }
     rx->cfg = *cfg;
-    for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i)
+    for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i) {
         rx->streams[i].fd = AES67_BAD_SOCK;
+        rx->streams[i].sock = -1;
+#if !defined(__linux__)
+        rx->socks[i] = AES67_BAD_SOCK;
+#endif
+    }
     /* As many rings as the streams reach, and no more: a ring is 16 KB, and
        a fixed table of 64 was both a ceiling and a megabyte per receiver. */
     for (int i = 0; i < cfg->stream_count; ++i) {
@@ -404,18 +566,58 @@ aes67_rx_t *aes67_rx_open(const aes67_rx_cfg_t *cfg, char *errbuf, size_t errlen
     for (int i = 0; i < cfg->stream_count; ++i) {
         aes67_rx_stream_t *s = &rx->streams[i];
         s->cfg = cfg->streams[i];
+        s->group_addr = inet_addr(s->cfg.group);
+#if defined(__linux__)
         s->fd = open_stream_socket(cfg, &s->cfg, errbuf, errlen);
         if (s->fd == AES67_BAD_SOCK) {
             aes67_rx_close(rx);
             return NULL;
         }
-#if defined(__linux__)
         struct epoll_event ev = { .events = EPOLLIN, .data.ptr = s };
         if (epoll_ctl(rx->epfd, EPOLL_CTL_ADD, s->fd, &ev) < 0) {
             snprintf(errbuf, errlen, "epoll_ctl: %s", strerror(errno));
             aes67_rx_close(rx);
             return NULL;
         }
+#else
+        /* The port's socket, opened by the first stream on it; the group
+           joined once per socket however many streams read it. */
+        int sock = -1;
+        for (int k = 0; k < rx->sock_count; ++k)
+            if (rx->sock_port[k] == s->cfg.port)
+                sock = k;
+        if (sock < 0) {
+            sock = rx->sock_count;
+            rx->socks[sock] = open_port_socket(cfg, s->cfg.port, errbuf, errlen);
+            if (rx->socks[sock] == AES67_BAD_SOCK) {
+                aes67_rx_close(rx);
+                return NULL;
+            }
+            rx->sock_port[sock] = s->cfg.port;
+            rx->sock_count++;
+#  if defined(_WIN32)
+            if (rx->wsa_recvmsg == NULL) {
+                GUID id = WSAID_WSARECVMSG;
+                DWORD bytes = 0;
+                if (WSAIoctl(rx->socks[sock], SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof id,
+                             &rx->wsa_recvmsg, sizeof rx->wsa_recvmsg, &bytes, NULL, NULL) != 0) {
+                    snprintf(errbuf, errlen, "WSARecvMsg: error %d", aes67_sockerr());
+                    aes67_rx_close(rx);
+                    return NULL;
+                }
+            }
+#  endif
+        }
+        bool joined = false;
+        for (int k = 0; k < i; ++k)
+            if (rx->streams[k].sock == sock && rx->streams[k].group_addr == s->group_addr)
+                joined = true;
+        if (!joined && !join_group(rx->socks[sock], cfg, s->cfg.group, errbuf, errlen)) {
+            aes67_rx_close(rx);
+            return NULL;
+        }
+        s->sock = sock;
+        s->fd = rx->socks[sock];
 #endif
     }
     return rx;
@@ -464,6 +666,16 @@ uint32_t aes67_rx_playout_ts(aes67_rx_t *rx, int stream, uint32_t margin_frames)
     return min_head - margin_frames;
 }
 
+uint64_t aes67_rx_foreign_packets(aes67_rx_t *rx)
+{
+#if defined(__linux__)
+    (void) rx;
+    return 0;   /* each socket is bound to its group: the kernel never hands us another's */
+#else
+    return atomic_load_explicit(&rx->not_ours, memory_order_relaxed);
+#endif
+}
+
 void aes67_rx_get_stats(aes67_rx_t *rx, int stream, aes67_rx_stream_stats_t *out)
 {
     if (stream >= 0 && stream < rx->cfg.stream_count)
@@ -489,12 +701,16 @@ void aes67_rx_close(aes67_rx_t *rx)
     if (rx == NULL)
         return;
     aes67_rx_stop(rx);
+#if defined(__linux__)
     for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i)
         if (rx->streams[i].fd != AES67_BAD_SOCK)
             aes67_closesock(rx->streams[i].fd);
-#if defined(__linux__)
     if (rx->epfd >= 0)
         close(rx->epfd);
+#else
+    for (int i = 0; i < rx->sock_count; ++i)   /* the streams share these */
+        if (rx->socks[i] != AES67_BAD_SOCK)
+            aes67_closesock(rx->socks[i]);
 #endif
 #if defined(_WIN32)
     if (rx->wsa_started)
