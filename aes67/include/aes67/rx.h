@@ -15,11 +15,11 @@
  *  - Linux: recvmmsg batches, epoll, SO_TIMESTAMPNS for arrival jitter,
  *    optional SO_BUSY_POLL and CPU pinning. This is the appliance path, and
  *    it is the one the receive benchmarks were measured on.
- *  - Everything else (Windows, macOS): one socket per port with every
- *    stream's group joined on it, poll + recvmsg one packet at a time, each
- *    packet sorted to its stream by its destination address (IP_PKTINFO, or
- *    IP_RECVDSTADDR on BSD), arrival stamped with the monotonic clock. So
- *    every stream can share 5004, as real AES67 does.
+ *  - Everything else (Windows, macOS): aes67_netrx (netrx.h) with this
+ *    receiver's rings -- one socket per port with every stream's group
+ *    joined on it, each packet sorted to its stream by its destination
+ *    address; an I/O completion port and an MMCSS thread on Windows, poll and
+ *    recvmsg elsewhere. So every stream can share 5004, as real AES67 does.
  */
 
 #include <stdbool.h>

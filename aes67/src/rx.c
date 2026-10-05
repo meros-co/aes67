@@ -3,73 +3,50 @@
 
 /* libaes67 receive. See rx.h.
  *
- * The packet path (aes67_rx_inject and below) is shared by both socket
- * paths and by the tests; only how packets get off the wire differs.
- *
  * Real AES67 puts every stream on one port (5004) and tells them apart by
- * multicast group. Linux binds a socket to each group, which does the
- * sorting in the kernel. Windows cannot bind a multicast address, and a
- * socket bound to the port receives every group joined on it (macOS is no
- * better with several streams on one socket), so there the receiver opens
- * one socket per port, joins every stream's group on it, and sorts each
- * packet by the destination address the kernel reports with it (IP_PKTINFO;
- * IP_RECVDSTADDR on BSD). A packet for a group no stream here asked for --
- * another receiver's, on the same port -- is dropped and counted. */
+ * multicast group. Linux binds a socket to each group, which does the sorting
+ * in the kernel, and reads it with recvmmsg and kernel timestamps. Everywhere
+ * else this receiver runs on aes67_netrx: one socket per port, every group
+ * joined on it, each packet sorted by its destination address (and, on
+ * Windows, received through an I/O completion port). Its rings are this
+ * receiver's, handed to aes67_netrx as the caller's.
+ *
+ * The packet path is aes67_rtp_write_rings either way; on Linux the
+ * statistics are kept here, elsewhere aes67_netrx keeps them. */
 
 #if defined(__linux__)
 #  define _GNU_SOURCE
 #endif
 
 #include "aes67/rx.h"
+#include "aes67/netrx.h"
+#include "platform.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_WIN32)
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-#  include <mswsock.h>
-#  include <windows.h>
-#  include <process.h>
-   typedef SOCKET aes67_sock_t;
-#  define AES67_BAD_SOCK INVALID_SOCKET
-#  define aes67_closesock closesocket
-#  define aes67_sockerr() WSAGetLastError()
-   typedef HANDLE aes67_thread_t;
-#else
-#  include <arpa/inet.h>
-#  include <netinet/in.h>
-#  include <pthread.h>
+#if defined(__linux__)
 #  include <sched.h>
-#  include <sys/socket.h>
+#  include <sys/epoll.h>
 #  include <sys/uio.h>
-#  include <time.h>
-#  include <unistd.h>
-#  if defined(__linux__)
-#    include <sys/epoll.h>
-#  else
-#    include <poll.h>
-#  endif
-   typedef int aes67_sock_t;
-#  define AES67_BAD_SOCK (-1)
-#  define aes67_closesock close
-#  define aes67_sockerr() errno
-   typedef pthread_t aes67_thread_t;
 #endif
 
 #define BATCH 64
 
 typedef struct aes67_rx_stream {
     aes67_rx_stream_cfg_t   cfg;
-    aes67_sock_t            fd;
-    int                     sock;          /* index into rx->socks (not Linux) */
     uint32_t                group_addr;    /* the group, network order */
+#if defined(__linux__)
+    aes67_sock_t            fd;
     uint16_t                last_seq;
     bool                    have_seq;
     uint64_t                last_arr_ns;
     aes67_rx_stream_stats_t stats;
+#else
+    int                     slot;          /* in rx->net */
+#endif
 } aes67_rx_stream_t;
 
 struct aes67_rx {
@@ -79,25 +56,17 @@ struct aes67_rx {
     int               ring_count;
 #if defined(__linux__)
     int               epfd;
-#else
-    /* One socket per port; streams on that port share it (see the top). */
-    aes67_sock_t      socks[AES67_RX_MAX_STREAMS];
-    uint16_t          sock_port[AES67_RX_MAX_STREAMS];
-    int               sock_count;
-    aes67_atomic_u64  not_ours;     /* packets for a group no stream here joined */
-#  if defined(_WIN32)
-    LPFN_WSARECVMSG   wsa_recvmsg;
-#  endif
-#endif
     aes67_thread_t    thread;
     bool              have_thread;
     aes67_atomic_u64  running;
-#if defined(_WIN32)
-    bool              wsa_started;
+#else
+    aes67_netrx_t    *net;
 #endif
 };
 
-/* ---- the packet path (platform-free) -------------------------------------- */
+#if defined(__linux__)
+
+/* ---- the packet path ------------------------------------------------------ */
 
 static void process_packet(aes67_rx_t *rx, aes67_rx_stream_t *s, const uint8_t *p, size_t len,
                            uint64_t arr_ns)
@@ -134,64 +103,23 @@ static void process_packet(aes67_rx_t *rx, aes67_rx_stream_t *s, const uint8_t *
     st->bytes += (uint64_t) len;
 }
 
-void aes67_rx_inject(aes67_rx_t *rx, int stream, const uint8_t *packet, size_t len, uint64_t arrival_ns)
-{
-    if (rx == NULL || stream < 0 || stream >= rx->cfg.stream_count)
-        return;
-    process_packet(rx, &rx->streams[stream], packet, len, arrival_ns);
-}
+/* ---- sockets: one per stream, bound to its group ---------------------------- */
 
-static uint64_t now_ns(void)
-{
-#if defined(_WIN32)
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (uint64_t) ((double) c.QuadPart * 1e9 / (double) f.QuadPart);
-#else
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t) t.tv_sec * 1000000000ull + (uint64_t) t.tv_nsec;
-#endif
-}
-
-/* ---- sockets --------------------------------------------------------------- */
-
-static bool set_nonblocking(aes67_sock_t fd)
-{
-#if defined(_WIN32)
-    u_long one = 1;
-    return ioctlsocket(fd, FIONBIO, &one) == 0;
-#else
-    (void) fd;
-    return true;   /* opened with SOCK_NONBLOCK below, or polled with a timeout */
-#endif
-}
-
-#if defined(__linux__)
 static aes67_sock_t open_stream_socket(const aes67_rx_cfg_t *cfg, const aes67_rx_stream_cfg_t *sc,
                                        char *errbuf, size_t errlen)
 {
-#if defined(__linux__)
     aes67_sock_t fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
-#else
-    aes67_sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
-#endif
     if (fd == AES67_BAD_SOCK) {
         snprintf(errbuf, errlen, "socket: error %d", aes67_sockerr());
         return AES67_BAD_SOCK;
     }
-    set_nonblocking(fd);
-
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
     int rcvbuf = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *) &rcvbuf, sizeof rcvbuf);
-#if defined(__linux__)
     setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one);
     if (cfg->busy_poll && cfg->busy_poll_us > 0)
         setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &cfg->busy_poll_us, sizeof cfg->busy_poll_us);
-#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -217,11 +145,8 @@ static aes67_sock_t open_stream_socket(const aes67_rx_cfg_t *cfg, const aes67_rx
     }
     return fd;
 }
-#endif
 
 /* ---- receive thread ---------------------------------------------------------- */
-
-#if defined(__linux__)
 
 static uint64_t cmsg_arrival_ns(struct msghdr *mh)
 {
@@ -231,7 +156,7 @@ static uint64_t cmsg_arrival_ns(struct msghdr *mh)
             memcpy(&ts, CMSG_DATA(c), sizeof ts);
             return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
         }
-    return now_ns();
+    return aes67_now_ns();
 }
 
 static void drain_stream(aes67_rx_t *rx, aes67_rx_stream_t *s)
@@ -261,7 +186,7 @@ static void drain_stream(aes67_rx_t *rx, aes67_rx_stream_t *s)
     }
 }
 
-static void *rx_thread_main(void *arg)
+AES67_THREAD_FN(rx_thread_main, arg)
 {
     aes67_rx_t *rx = arg;
     if (rx->cfg.cpu >= 0) {
@@ -279,201 +204,10 @@ static void *rx_thread_main(void *arg)
         for (int i = 0; i < n; ++i)
             drain_stream(rx, (aes67_rx_stream_t *) evs[i].data.ptr);
     }
-    return NULL;
+    AES67_THREAD_RETURN;
 }
 
-#else /* ---- portable: one socket per port, sorted by destination ---------- */
-
-/* A socket for every stream on `port`: bound to any address on it, told to
-   report each packet's destination. */
-static aes67_sock_t open_port_socket(const aes67_rx_cfg_t *cfg, uint16_t port, char *errbuf, size_t errlen)
-{
-    (void) cfg;
-    aes67_sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd == AES67_BAD_SOCK) {
-        snprintf(errbuf, errlen, "socket: error %d", aes67_sockerr());
-        return AES67_BAD_SOCK;
-    }
-    set_nonblocking(fd);
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
-#if defined(SO_REUSEPORT)
-    /* BSD: another socket (another receiver, another program) on the same
-       port needs it as well as SO_REUSEADDR. */
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *) &one, sizeof one);
-#endif
-    int rcvbuf = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *) &rcvbuf, sizeof rcvbuf);
-#if defined(_WIN32) || (defined(IP_PKTINFO) && !defined(IP_RECVDSTADDR))
-    if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, (const char *) &one, sizeof one) != 0) {
-        snprintf(errbuf, errlen, "IP_PKTINFO: error %d", aes67_sockerr());
-        aes67_closesock(fd);
-        return AES67_BAD_SOCK;
-    }
-#else
-    if (setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, (const char *) &one, sizeof one) != 0) {
-        snprintf(errbuf, errlen, "IP_RECVDSTADDR: error %d", aes67_sockerr());
-        aes67_closesock(fd);
-        return AES67_BAD_SOCK;
-    }
-#endif
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(fd, (struct sockaddr *) &addr, sizeof addr) < 0) {
-        snprintf(errbuf, errlen, "bind port %u: error %d", port, aes67_sockerr());
-        aes67_closesock(fd);
-        return AES67_BAD_SOCK;
-    }
-    return fd;
-}
-
-static bool join_group(aes67_sock_t fd, const aes67_rx_cfg_t *cfg, const char *group, char *errbuf, size_t errlen)
-{
-    struct ip_mreq mreq;
-    memset(&mreq, 0, sizeof mreq);
-    mreq.imr_multiaddr.s_addr = inet_addr(group);
-    mreq.imr_interface.s_addr = cfg->iface_ip[0] ? inet_addr(cfg->iface_ip) : htonl(INADDR_ANY);
-    if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mreq, sizeof mreq) < 0) {
-        snprintf(errbuf, errlen, "IP_ADD_MEMBERSHIP %s: error %d", group, aes67_sockerr());
-        return false;
-    }
-    return true;
-}
-
-/* One datagram and the address it was sent to (network order; 0 when the
-   kernel did not say). -1 when there is nothing to read. */
-static int recv_with_destination(aes67_rx_t *rx, aes67_sock_t fd, uint8_t *buf, size_t cap, uint32_t *dst)
-{
-    *dst = 0;
-#if defined(_WIN32)
-    char ctrl[128];
-    struct sockaddr_in from;
-    WSABUF wb;
-    wb.len = (ULONG) cap;
-    wb.buf = (CHAR *) buf;
-    WSAMSG msg;
-    memset(&msg, 0, sizeof msg);
-    msg.name = (LPSOCKADDR) &from;
-    msg.namelen = sizeof from;
-    msg.lpBuffers = &wb;
-    msg.dwBufferCount = 1;
-    msg.Control.buf = ctrl;
-    msg.Control.len = sizeof ctrl;
-    DWORD got = 0;
-    if (rx->wsa_recvmsg == NULL || rx->wsa_recvmsg(fd, &msg, &got, NULL, NULL) != 0)
-        return -1;
-    for (WSACMSGHDR *c = WSA_CMSG_FIRSTHDR(&msg); c != NULL; c = WSA_CMSG_NXTHDR(&msg, c))
-        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
-            IN_PKTINFO pi;
-            memcpy(&pi, WSA_CMSG_DATA(c), sizeof pi);
-            *dst = pi.ipi_addr.s_addr;
-        }
-    return (int) got;
-#else
-    (void) rx;
-    union { char buf[128]; struct cmsghdr align; } ctrl;
-    struct iovec iov;
-    iov.iov_base = buf;
-    iov.iov_len = cap;
-    struct msghdr mh;
-    memset(&mh, 0, sizeof mh);
-    mh.msg_iov = &iov;
-    mh.msg_iovlen = 1;
-    mh.msg_control = ctrl.buf;
-    mh.msg_controllen = sizeof ctrl.buf;
-    const ssize_t n = recvmsg(fd, &mh, MSG_DONTWAIT);
-    if (n <= 0)
-        return -1;
-    for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c != NULL; c = CMSG_NXTHDR(&mh, c)) {
-#  if defined(IP_RECVDSTADDR)
-        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_RECVDSTADDR)
-            memcpy(dst, CMSG_DATA(c), sizeof *dst);
-#  else
-        if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
-            struct in_pktinfo pi;
-            memcpy(&pi, CMSG_DATA(c), sizeof pi);
-            *dst = pi.ipi_addr.s_addr;
-        }
-#  endif
-    }
-    return (int) n;
-#endif
-}
-
-static void drain_socket(aes67_rx_t *rx, int sock)
-{
-    uint8_t buf[2048];
-    for (int i = 0; i < BATCH; ++i) {
-        uint32_t dst = 0;
-        const int n = recv_with_destination(rx, rx->socks[sock], buf, sizeof buf, &dst);
-        if (n <= 0)
-            return;
-        const uint64_t arrived = now_ns();
-        /* Every stream on this socket that the packet was addressed to (two
-           streams may read different channels of one group). Without a
-           destination, a socket with one group can still only mean it. */
-        int matched = 0, only = -1, groups = 0;
-        for (int k = 0; k < rx->cfg.stream_count; ++k) {
-            aes67_rx_stream_t *s = &rx->streams[k];
-            if (s->sock != sock)
-                continue;
-            if (only < 0 || rx->streams[only].group_addr != s->group_addr)
-                ++groups;
-            only = k;
-            if (dst != 0 && s->group_addr == dst) {
-                process_packet(rx, s, buf, (size_t) n, arrived);
-                ++matched;
-            }
-        }
-        if (matched == 0 && dst == 0 && groups == 1 && only >= 0)
-            process_packet(rx, &rx->streams[only], buf, (size_t) n, arrived);
-        else if (matched == 0)
-            aes67_atomic_fetch_add(&rx->not_ours, 1, AES67_MO_RELAXED);
-    }
-}
-
-#if defined(_WIN32)
-static unsigned __stdcall rx_thread_main(void *arg)
-#else
-static void *rx_thread_main(void *arg)
-#endif
-{
-    aes67_rx_t *rx = arg;
-#if defined(_WIN32)
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    WSAPOLLFD fds[AES67_RX_MAX_STREAMS];
-#else
-    struct pollfd fds[AES67_RX_MAX_STREAMS];
-#endif
-    while (aes67_atomic_load(&rx->running, AES67_MO_RELAXED)) {
-        for (int i = 0; i < rx->sock_count; ++i) {
-            fds[i].fd = rx->socks[i];
-            fds[i].events = POLLIN;
-            fds[i].revents = 0;
-        }
-#if defined(_WIN32)
-        const int n = WSAPoll(fds, (ULONG) rx->sock_count, 100);
-#else
-        const int n = poll(fds, (nfds_t) rx->sock_count, 100);
-#endif
-        if (n <= 0)
-            continue;
-        for (int i = 0; i < rx->sock_count; ++i)
-            if (fds[i].revents & POLLIN)
-                drain_socket(rx, i);
-    }
-#if defined(_WIN32)
-    return 0;
-#else
-    return NULL;
-#endif
-}
-
-#endif
+#endif /* __linux__ */
 
 /* ---- public API ------------------------------------------------------------- */
 
@@ -489,13 +223,11 @@ aes67_rx_t *aes67_rx_open(const aes67_rx_cfg_t *cfg, char *errbuf, size_t errlen
         return NULL;
     }
     rx->cfg = *cfg;
-    for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i) {
+#if defined(__linux__)
+    rx->epfd = -1;
+    for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i)
         rx->streams[i].fd = AES67_BAD_SOCK;
-        rx->streams[i].sock = -1;
-#if !defined(__linux__)
-        rx->socks[i] = AES67_BAD_SOCK;
 #endif
-    }
     /* As many rings as the streams reach, and no more: a ring is 16 KB, and
        a fixed table of 64 was both a ceiling and a megabyte per receiver. */
     for (int i = 0; i < cfg->stream_count; ++i) {
@@ -506,36 +238,23 @@ aes67_rx_t *aes67_rx_open(const aes67_rx_cfg_t *cfg, char *errbuf, size_t errlen
     rx->rings = rx->ring_count > 0 ? calloc((size_t) rx->ring_count, sizeof *rx->rings) : NULL;
     if (rx->ring_count > 0 && rx->rings == NULL) {
         snprintf(errbuf, errlen, "oom");
-        free(rx->rings);
         free(rx);
         return NULL;
     }
     for (int i = 0; i < rx->ring_count; ++i)
         aes67_ring_init(&rx->rings[i]);
-#if defined(_WIN32)
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        snprintf(errbuf, errlen, "WSAStartup failed");
-        free(rx->rings);
-        free(rx);
-        return NULL;
-    }
-    rx->wsa_started = true;
-#endif
+
 #if defined(__linux__)
     rx->epfd = epoll_create1(0);
     if (rx->epfd < 0) {
         snprintf(errbuf, errlen, "epoll_create1: %s", strerror(errno));
-        free(rx->rings);
-        free(rx);
+        aes67_rx_close(rx);
         return NULL;
     }
-#endif
     for (int i = 0; i < cfg->stream_count; ++i) {
         aes67_rx_stream_t *s = &rx->streams[i];
         s->cfg = cfg->streams[i];
         s->group_addr = inet_addr(s->cfg.group);
-#if defined(__linux__)
         s->fd = open_stream_socket(cfg, &s->cfg, errbuf, errlen);
         if (s->fd == AES67_BAD_SOCK) {
             aes67_rx_close(rx);
@@ -547,64 +266,65 @@ aes67_rx_t *aes67_rx_open(const aes67_rx_cfg_t *cfg, char *errbuf, size_t errlen
             aes67_rx_close(rx);
             return NULL;
         }
+    }
 #else
-        /* The port's socket, opened by the first stream on it; the group
-           joined once per socket however many streams read it. */
-        int sock = -1;
-        for (int k = 0; k < rx->sock_count; ++k)
-            if (rx->sock_port[k] == s->cfg.port)
-                sock = k;
-        if (sock < 0) {
-            sock = rx->sock_count;
-            rx->socks[sock] = open_port_socket(cfg, s->cfg.port, errbuf, errlen);
-            if (rx->socks[sock] == AES67_BAD_SOCK) {
-                aes67_rx_close(rx);
-                return NULL;
-            }
-            rx->sock_port[sock] = s->cfg.port;
-            rx->sock_count++;
-#  if defined(_WIN32)
-            if (rx->wsa_recvmsg == NULL) {
-                GUID id = WSAID_WSARECVMSG;
-                DWORD bytes = 0;
-                if (WSAIoctl(rx->socks[sock], SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof id,
-                             &rx->wsa_recvmsg, sizeof rx->wsa_recvmsg, &bytes, NULL, NULL) != 0) {
-                    snprintf(errbuf, errlen, "WSARecvMsg: error %d", aes67_sockerr());
-                    aes67_rx_close(rx);
-                    return NULL;
-                }
-            }
-#  endif
-        }
-        bool joined = false;
-        for (int k = 0; k < i; ++k)
-            if (rx->streams[k].sock == sock && rx->streams[k].group_addr == s->group_addr)
-                joined = true;
-        if (!joined && !join_group(rx->socks[sock], cfg, s->cfg.group, errbuf, errlen)) {
+    rx->net = aes67_netrx_open(cfg->iface_ip, errbuf, errlen);
+    if (rx->net == NULL) {
+        aes67_rx_close(rx);
+        return NULL;
+    }
+    for (int i = 0; i < cfg->stream_count; ++i) {
+        aes67_rx_stream_t *s = &rx->streams[i];
+        s->cfg = cfg->streams[i];
+        if (!aes67_parse_ipv4(s->cfg.group, &s->group_addr)) {
+            snprintf(errbuf, errlen, "bad group %s", s->cfg.group);
             aes67_rx_close(rx);
             return NULL;
         }
-        s->sock = sock;
-        s->fd = rx->socks[sock];
-#endif
+        aes67_netrx_stream_cfg_t nc;
+        memset(&nc, 0, sizeof nc);
+        nc.group = s->group_addr;
+        nc.port = s->cfg.port;
+        nc.payload_type = s->cfg.payload_type;
+        nc.format = s->cfg.format;
+        nc.channels = s->cfg.channels;
+        nc.media_clock_offset = 0;   /* this receiver's rings are indexed by RTP timestamp */
+        nc.rings = rx->rings + s->cfg.first_channel;
+        s->slot = aes67_netrx_add_stream(rx->net, &nc, errbuf, errlen);
+        if (s->slot < 0) {
+            aes67_rx_close(rx);
+            return NULL;
+        }
     }
+#endif
     return rx;
 }
 
 bool aes67_rx_start(aes67_rx_t *rx)
 {
+#if defined(__linux__)
     if (rx->have_thread)
         return true;
     aes67_atomic_store(&rx->running, 1, AES67_MO_SEQ_CST);
-#if defined(_WIN32)
-    rx->thread = (HANDLE) _beginthreadex(NULL, 0, rx_thread_main, rx, 0, NULL);
-    rx->have_thread = rx->thread != NULL;
-#else
-    rx->have_thread = pthread_create(&rx->thread, NULL, rx_thread_main, rx) == 0;
-#endif
+    rx->have_thread = aes67_thread_start(&rx->thread, rx_thread_main, rx);
     if (!rx->have_thread)
         aes67_atomic_store(&rx->running, 0, AES67_MO_SEQ_CST);
     return rx->have_thread;
+#else
+    return aes67_netrx_start(rx->net);
+#endif
+}
+
+void aes67_rx_inject(aes67_rx_t *rx, int stream, const uint8_t *packet, size_t len, uint64_t arrival_ns)
+{
+    if (rx == NULL || stream < 0 || stream >= rx->cfg.stream_count)
+        return;
+#if defined(__linux__)
+    process_packet(rx, &rx->streams[stream], packet, len, arrival_ns);
+#else
+    const aes67_rx_stream_t *s = &rx->streams[stream];
+    aes67_netrx_inject(rx->net, 0, s->group_addr, s->cfg.port, packet, len, arrival_ns);
+#endif
 }
 
 int aes67_rx_read(aes67_rx_t *rx, int channel, uint32_t ts, int32_t *out, int frames)
@@ -640,49 +360,58 @@ uint64_t aes67_rx_foreign_packets(aes67_rx_t *rx)
     (void) rx;
     return 0;   /* each socket is bound to its group: the kernel never hands us another's */
 #else
-    return aes67_atomic_load(&rx->not_ours, AES67_MO_RELAXED);
+    return aes67_netrx_foreign_packets(rx->net);
 #endif
 }
 
 void aes67_rx_get_stats(aes67_rx_t *rx, int stream, aes67_rx_stream_stats_t *out)
 {
-    if (stream >= 0 && stream < rx->cfg.stream_count)
-        *out = rx->streams[stream].stats;   /* a torn read of statistics is acceptable */
+    if (stream < 0 || stream >= rx->cfg.stream_count)
+        return;
+#if defined(__linux__)
+    *out = rx->streams[stream].stats;   /* a torn read of statistics is acceptable */
+#else
+    aes67_netrx_stats_t n;
+    aes67_netrx_get_stats(rx->net, rx->streams[stream].slot, &n);
+    memset(out, 0, sizeof *out);
+    out->packets = n.packets;
+    out->bytes = n.bytes;
+    out->seq_lost = n.lost;
+    out->seq_reordered = n.reordered;
+    out->wrong_pt = n.wrong_pt;
+    out->too_short = n.malformed;
+    out->last_seq_valid = n.last_seq_valid ? 1 : 0;
+    out->last_seq = n.last_seq;
+    out->jitter_worst_ns = n.jitter_worst_ns;
+#endif
 }
 
 void aes67_rx_stop(aes67_rx_t *rx)
 {
+#if defined(__linux__)
     if (!rx->have_thread)
         return;
     aes67_atomic_store(&rx->running, 0, AES67_MO_SEQ_CST);
-#if defined(_WIN32)
-    WaitForSingleObject(rx->thread, INFINITE);
-    CloseHandle(rx->thread);
-#else
-    pthread_join(rx->thread, NULL);
-#endif
+    aes67_thread_join(rx->thread);
     rx->have_thread = false;
+#else
+    aes67_netrx_stop(rx->net);
+#endif
 }
 
 void aes67_rx_close(aes67_rx_t *rx)
 {
     if (rx == NULL)
         return;
-    aes67_rx_stop(rx);
 #if defined(__linux__)
+    aes67_rx_stop(rx);
     for (int i = 0; i < AES67_RX_MAX_STREAMS; ++i)
         if (rx->streams[i].fd != AES67_BAD_SOCK)
             aes67_closesock(rx->streams[i].fd);
     if (rx->epfd >= 0)
         close(rx->epfd);
 #else
-    for (int i = 0; i < rx->sock_count; ++i)   /* the streams share these */
-        if (rx->socks[i] != AES67_BAD_SOCK)
-            aes67_closesock(rx->socks[i]);
-#endif
-#if defined(_WIN32)
-    if (rx->wsa_started)
-        WSACleanup();
+    aes67_netrx_close(rx->net);   /* stops, leaves, closes: the rings are untouched after */
 #endif
     free(rx->rings);
     free(rx);
