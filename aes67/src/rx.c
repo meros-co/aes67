@@ -193,7 +193,12 @@ AES67_THREAD_FN(rx_thread_main, arg)
         cpu_set_t set;
         CPU_ZERO(&set);
         CPU_SET(rx->cfg.cpu, &set);
+#if defined(__ANDROID__)
+        /* Bionic has no pthread_setaffinity_np; pid 0 is the calling thread. */
+        sched_setaffinity(0, sizeof set, &set);
+#else
         pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
     }
     struct sched_param sp = { .sched_priority = 80 };
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* best effort */

@@ -28,6 +28,9 @@ ctest --test-dir build
 
 The socket tests use multicast on loopback and skip themselves where the OS doesn't deliver it.
 
+It also cross-compiles for Android with the NDK's CMake toolchain (API 24 or later; arm64-v8a and
+armeabi-v7a), where it takes the Linux receive path.
+
 ## Use
 
 Add the repository as a subdirectory, and link the targets:
