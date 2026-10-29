@@ -31,6 +31,10 @@
 #    include <sched.h>
 #  endif
 #  if defined(__APPLE__)
+#    include <mach/mach.h>
+#    include <mach/mach_time.h>
+#    include <mach/thread_policy.h>
+#    include <pthread.h>
 #    include <sys/qos.h>
 #  endif
 #endif
@@ -352,7 +356,21 @@ AES67_THREAD_FN(netrx_thread_main, arg)
 {
     aes67_netrx_t *rx = (aes67_netrx_t *) arg;
 #if defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    /* Real-time, as Core Audio's IO threads are: "user interactive" alone
+       lets macOS leave a packet waiting several milliseconds. Each wake-up
+       asks for up to 250 us of work within 500 us, about every millisecond. */
+    {
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        thread_time_constraint_policy_data_t p;
+        p.period = (uint32_t) (1000000ull * tb.denom / tb.numer);
+        p.computation = (uint32_t) (250000ull * tb.denom / tb.numer);
+        p.constraint = (uint32_t) (500000ull * tb.denom / tb.numer);
+        p.preemptible = 1;
+        if (thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                              (thread_policy_t) &p, THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS)
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
 #elif defined(__linux__)
     struct sched_param sp = { .sched_priority = 80 };
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   /* best effort */
