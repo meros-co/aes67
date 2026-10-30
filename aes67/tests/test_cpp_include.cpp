@@ -9,6 +9,7 @@
 
 #include <aes67/rtp.h>
 #include <aes67/rx.h>
+#include <aes67/sap.h>
 #include <aes67/sdp.h>
 #include <aes67/tx.h>
 

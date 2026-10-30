@@ -15,6 +15,7 @@ add_library(meros_aes67 STATIC
     src/netrx.c
     src/tx.c
     src/ids.c
+    src/sap.c
 )
 add_library(meros::aes67 ALIAS meros_aes67)
 

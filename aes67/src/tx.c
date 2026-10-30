@@ -2,10 +2,11 @@
  * Copyright (C) 2026 Meros Inc. */
 
 /* libaes67 transmit. See tx.h. RTP packetisation and the socket path are
-   complete; SAP is a minimal, conformant RFC 2974 v1 announcement (no
-   deletion, no auth, no compression). */
+   complete; SAP is a conformant RFC 2974 v1 announcement and deletion (no
+   auth, no compression). */
 
 #include "aes67/tx.h"
+#include "aes67/sap.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -30,9 +31,6 @@
 #  define aes67_sockerr() errno
 #endif
 
-#define SAP_GROUP       "239.255.255.255"
-#define SAP_PORT        9875
-#define SAP_INTERVAL_MS 30000
 
 typedef struct aes67_tx_stream {
     aes67_tx_stream_cfg_t cfg;
@@ -43,6 +41,8 @@ typedef struct aes67_tx_stream {
     uint64_t              packets_sent;
     uint64_t              last_sap_ms;
     uint16_t              sap_hash;
+    bool                  sap_announced;
+    bool                  sap_withdrawn;
 } aes67_tx_stream_t;
 
 struct aes67_tx {
@@ -147,8 +147,8 @@ aes67_tx_t *aes67_tx_open(const aes67_tx_cfg_t *cfg, char *errbuf, size_t errlen
         }
         memset(&tx->sap_dst, 0, sizeof tx->sap_dst);
         tx->sap_dst.sin_family = AF_INET;
-        tx->sap_dst.sin_port = htons(SAP_PORT);
-        tx->sap_dst.sin_addr.s_addr = inet_addr(SAP_GROUP);
+        tx->sap_dst.sin_port = htons(AES67_SAP_PORT);
+        tx->sap_dst.sin_addr.s_addr = inet_addr(AES67_SAP_GROUP);
     }
     return tx;
 }
@@ -224,31 +224,44 @@ int aes67_tx_sdp(aes67_tx_t *tx, int stream, char *buf, size_t len)
     return aes67_sdp_write(buf, len, &p);
 }
 
+/* Sends one stream's announcement or deletion. */
+static bool sap_send(aes67_tx_t *tx, int i, bool deletion)
+{
+    char sdp[1200 - 8 - sizeof "application/sdp"];   /* what fits the packet after the header */
+    const int n = aes67_tx_sdp(tx, i, sdp, sizeof sdp);
+    if (n <= 0 || (size_t) n >= sizeof sdp)
+        return false;
+    const uint32_t origin = tx->cfg.iface_ip[0] ? inet_addr(tx->cfg.iface_ip) : 0;   /* network order */
+    uint8_t pkt[1200];
+    const size_t len = aes67_sap_build(pkt, sizeof pkt, deletion, tx->streams[i].sap_hash,
+                                       (const uint8_t *) &origin, sdp, (size_t) n);
+    return len > 0 && sendto(tx->sap_fd, (const char *) pkt, (int) len, 0,
+                             (struct sockaddr *) &tx->sap_dst, sizeof tx->sap_dst) == (int) len;
+}
+
 void aes67_tx_sap_tick(aes67_tx_t *tx, uint64_t now_ms)
 {
     if (tx == NULL || tx->sap_fd == AES67_BAD_SOCK)
         return;
     for (int i = 0; i < tx->cfg.stream_count; ++i) {
         aes67_tx_stream_t *s = &tx->streams[i];
-        if (s->last_sap_ms && now_ms - s->last_sap_ms < SAP_INTERVAL_MS)
+        if (s->sap_withdrawn || (s->last_sap_ms && now_ms - s->last_sap_ms < AES67_SAP_INTERVAL_MS))
             continue;
         s->last_sap_ms = now_ms;
+        if (sap_send(tx, i, false))
+            s->sap_announced = true;
+    }
+}
 
-        uint8_t pkt[1200];
-        const uint32_t origin = tx->cfg.iface_ip[0] ? inet_addr(tx->cfg.iface_ip) : 0;
-        pkt[0] = 0x20;   /* v=1, announce, IPv4, no auth or compression */
-        pkt[1] = 0;      /* auth length */
-        pkt[2] = (uint8_t) (s->sap_hash >> 8);
-        pkt[3] = (uint8_t) s->sap_hash;
-        memcpy(pkt + 4, &origin, 4);
-        const char *mime = "application/sdp";
-        size_t off = 8;
-        memcpy(pkt + off, mime, strlen(mime) + 1);
-        off += strlen(mime) + 1;
-        const int n = aes67_tx_sdp(tx, i, (char *) pkt + off, sizeof pkt - off);
-        if (n > 0 && off + (size_t) n <= sizeof pkt)
-            sendto(tx->sap_fd, (const char *) pkt, (int) (off + (size_t) n), 0,
-                   (struct sockaddr *) &tx->sap_dst, sizeof tx->sap_dst);
+void aes67_tx_sap_delete(aes67_tx_t *tx, int stream)
+{
+    if (tx == NULL || stream >= tx->cfg.stream_count)
+        return;
+    for (int i = stream < 0 ? 0 : stream; i < (stream < 0 ? tx->cfg.stream_count : stream + 1); ++i) {
+        aes67_tx_stream_t *s = &tx->streams[i];
+        if (s->sap_announced && !s->sap_withdrawn && tx->sap_fd != AES67_BAD_SOCK)
+            sap_send(tx, i, true);
+        s->sap_withdrawn = true;
     }
 }
 

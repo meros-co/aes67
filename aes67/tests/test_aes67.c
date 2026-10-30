@@ -13,14 +13,28 @@
 #include "aes67/netrx.h"
 #include "aes67/rtp.h"
 #include "aes67/rx.h"
+#include "aes67/sap.h"
 #include "aes67/sdp.h"
 #include "aes67/tx.h"
 
 #if defined(_WIN32)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  include <windows.h>
 #  define sleep_ms(ms) Sleep(ms)
+   typedef SOCKET test_sock_t;
+#  define TEST_BAD_SOCK INVALID_SOCKET
+#  define test_closesock closesocket
 #else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <sys/time.h>
+#  include <unistd.h>
 #  include <time.h>
+   typedef int test_sock_t;
+#  define TEST_BAD_SOCK (-1)
+#  define test_closesock close
 static void sleep_ms(int ms) { struct timespec t = { ms / 1000, (ms % 1000) * 1000000L }; nanosleep(&t, NULL); }
 #endif
 
@@ -1275,8 +1289,159 @@ static void test_sdp_unicast_and_channel_order(void)
     CHECK(aes67_sdp_write(tiny, sizeof tiny, &p) == n);   /* snprintf-style, with the fmtp too */
 }
 
+/* SAP packets: what the builder writes, the parser reads back, in both
+   directions and with the payload type left out as RFC 2974 allows. */
+static void test_sap_packets(void)
+{
+    const char sdp[] = "v=0\r\ns=Test\r\n";
+    const uint8_t origin[4] = { 10, 1, 2, 3 };
+    uint8_t pkt[256];
+    size_t n = aes67_sap_build(pkt, sizeof pkt, false, 0xBEEF, origin, sdp, strlen(sdp));
+    CHECK(n == 8 + 16 + strlen(sdp));
+    CHECK(pkt[0] == 0x20 && pkt[1] == 0 && pkt[2] == 0xBE && pkt[3] == 0xEF);
+    CHECK(memcmp(pkt + 4, origin, 4) == 0 && memcmp(pkt + 8, "application/sdp", 16) == 0);
+    aes67_sap_msg_t m;
+    CHECK(aes67_sap_parse(pkt, n, &m));
+    CHECK(!m.deletion && m.msg_hash == 0xBEEF && !m.origin_ipv6 && memcmp(m.origin, origin, 4) == 0);
+    CHECK(m.sdp_len == strlen(sdp) && memcmp(m.sdp, sdp, m.sdp_len) == 0);
+
+    n = aes67_sap_build(pkt, sizeof pkt, true, 0xBEEF, origin, sdp, strlen(sdp));
+    CHECK(pkt[0] == 0x24);
+    CHECK(aes67_sap_parse(pkt, n, &m) && m.deletion && m.msg_hash == 0xBEEF);
+
+    CHECK(aes67_sap_build(pkt, sizeof pkt, false, 0, origin, sdp, strlen(sdp)) == 0);   /* hash 0 is reserved */
+    CHECK(aes67_sap_build(pkt, 30, false, 1, origin, sdp, strlen(sdp)) == 0);          /* does not fit */
+
+    /* No payload type, and four bytes of authentication data skipped. */
+    uint8_t bare[64] = { 0x20, 1, 0x12, 0x34, 192, 168, 0, 1, 0xAA, 0xBB, 0xCC, 0xDD };
+    memcpy(bare + 12, sdp, strlen(sdp));
+    CHECK(aes67_sap_parse(bare, 12 + strlen(sdp), &m));
+    CHECK(m.msg_hash == 0x1234 && m.origin[0] == 192 && m.sdp_len == strlen(sdp) && m.sdp[0] == 'v');
+
+    /* Not ours: version 2, encrypted, compressed, another payload type. */
+    bare[0] = 0x40;
+    CHECK(!aes67_sap_parse(bare, 12 + strlen(sdp), &m));
+    bare[0] = 0x22;
+    CHECK(!aes67_sap_parse(bare, 12 + strlen(sdp), &m));
+    bare[0] = 0x21;
+    CHECK(!aes67_sap_parse(bare, 12 + strlen(sdp), &m));
+    uint8_t other[64] = { 0x20, 0, 0, 1, 1, 2, 3, 4 };
+    memcpy(other + 8, "text/plain", 11);
+    CHECK(!aes67_sap_parse(other, 8 + 11 + 3, &m));
+    CHECK(!aes67_sap_parse(other, 7, &m));
+}
+
+static test_sock_t sap_listener(void)
+{
+    test_sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == TEST_BAD_SOCK)
+        return fd;
+    const int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(AES67_SAP_PORT);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    struct ip_mreq mr;
+    mr.imr_multiaddr.s_addr = inet_addr(AES67_SAP_GROUP);
+    mr.imr_interface.s_addr = inet_addr("127.0.0.1");
+#if defined(_WIN32)
+    const DWORD timeout = 300;
+#else
+    const struct timeval timeout = { 0, 300000 };
+#endif
+    if (bind(fd, (struct sockaddr *) &a, sizeof a) != 0 ||
+        setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *) &mr, sizeof mr) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof timeout) != 0) {
+        test_closesock(fd);
+        return TEST_BAD_SOCK;
+    }
+    return fd;
+}
+
+/* The next SAP packet from our own stream (other announcers may share the
+   group); false when none came in time. */
+static bool next_sap(test_sock_t fd, const char *session, aes67_sap_msg_t *m, uint8_t *buf, size_t cap)
+{
+    for (int tries = 0; tries < 20; ++tries) {
+        const int n = (int) recv(fd, (char *) buf, (int) cap, 0);
+        if (n <= 0)
+            return false;
+        if (aes67_sap_parse(buf, (size_t) n, m) && m->sdp_len > 0) {
+            char line[96];
+            snprintf(line, sizeof line, "s=%s\r\n", session);
+            for (size_t i = 0; i + strlen(line) <= m->sdp_len; ++i)
+                if (memcmp(m->sdp + i, line, strlen(line)) == 0)
+                    return true;
+        }
+    }
+    return false;
+}
+
+/* A transmitter announces, then withdraws with a deletion under the same
+   hash, and announces that stream no more. Over loopback multicast, when the
+   machine delivers it. */
+static void test_sap_deletion_if_possible(void)
+{
+    aes67_tx_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.stream_count = 2;
+    cfg.announce_sap = true;
+    strcpy(cfg.iface_ip, "127.0.0.1");
+    for (int i = 0; i < 2; ++i) {
+        strcpy(cfg.streams[i].group, "239.69.9.9");
+        cfg.streams[i].port = (uint16_t) (5004 + i);
+        cfg.streams[i].payload_type = 98;
+        cfg.streams[i].channels = 2;
+    }
+    char session[2][64];
+    snprintf(session[0], sizeof session[0], "SAP test %u", (unsigned) aes67_new_ssrc());
+    snprintf(session[1], sizeof session[1], "SAP test %u", (unsigned) aes67_new_ssrc());
+    strcpy(cfg.streams[0].name, session[0]);
+    strcpy(cfg.streams[1].name, session[1]);
+    char err[128] = { 0 };
+    aes67_tx_t *tx = aes67_tx_open(&cfg, err, sizeof err);   /* also starts Winsock for the listener */
+    CHECK(tx != NULL);
+    if (tx == NULL) {
+        printf("  SAP deletion: %s\n", err);
+        return;
+    }
+    aes67_tx_sap_delete(tx, 0);   /* never announced: sends nothing, and withdraws it */
+    const test_sock_t fd = sap_listener();
+    if (fd == TEST_BAD_SOCK) {
+        printf("  SAP deletion on the wire skipped: no loopback multicast\n");
+        aes67_tx_close(tx);
+        return;
+    }
+    uint8_t buf[1500];
+    aes67_sap_msg_t m;
+    aes67_tx_sap_tick(tx, 1000);
+    if (!next_sap(fd, session[1], &m, buf, sizeof buf)) {
+        printf("  SAP deletion on the wire skipped: loopback multicast not delivered\n");
+        test_closesock(fd);
+        aes67_tx_close(tx);
+        return;
+    }
+    CHECK(!m.deletion && m.msg_hash != 0);
+    const uint16_t hash = m.msg_hash;
+    CHECK(!next_sap(fd, session[0], &m, buf, sizeof buf));   /* stream 0 was withdrawn first */
+
+    aes67_tx_sap_delete(tx, -1);
+    CHECK(next_sap(fd, session[1], &m, buf, sizeof buf));
+    CHECK(m.deletion && m.msg_hash == hash);
+    aes67_tx_sap_tick(tx, 1000 + AES67_SAP_INTERVAL_MS);   /* due again, but withdrawn */
+    CHECK(!next_sap(fd, session[1], &m, buf, sizeof buf));
+    aes67_tx_sap_delete(tx, -1);                             /* twice is once */
+    CHECK(!next_sap(fd, session[1], &m, buf, sizeof buf));
+    test_closesock(fd);
+    aes67_tx_close(tx);
+}
+
 int main(void)
 {
+    test_sap_packets();
+    test_sap_deletion_if_possible();
     test_transmit_l16();
     test_sdp_unicast_and_channel_order();
     test_identifiers_are_never_reused();

@@ -77,6 +77,14 @@ int aes67_tx_sdp(aes67_tx_t *tx, int stream, char *buf, size_t len);
    30 s (RFC 2974). */
 void aes67_tx_sap_tick(aes67_tx_t *tx, uint64_t now_ms);
 
+/* Withdraws a stream's SAP announcement at once with a deletion packet, so
+   receivers drop it now rather than when it times out; `stream` < 0
+   withdraws every stream. A withdrawn stream is not announced again by this
+   transmitter. A stream never announced sends nothing. aes67_tx_close does
+   not call this: a caller that closes to reopen at once keeps its streams
+   listed, and one that is going away calls this first. */
+void aes67_tx_sap_delete(aes67_tx_t *tx, int stream);
+
 uint64_t aes67_tx_packets_sent(aes67_tx_t *tx, int stream);
 void aes67_tx_close(aes67_tx_t *tx);
 

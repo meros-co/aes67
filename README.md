@@ -3,7 +3,10 @@
 Two small, portable C11 libraries for audio-over-IP devices:
 
 - **`aes67/`** (`meros::aes67`): AES67 / SMPTE ST 2110-30 RTP receive and transmit, L16/L24 framing,
-  a timestamp-indexed playout ring, SDP generation and parsing, and SAP announcement. On Linux, receive
+  a timestamp-indexed playout ring, SDP generation and parsing, and SAP announcement and deletion.
+  `aes67_new_ssrc` and `aes67_new_sap_hash` hand out identifiers no other stream in the process has,
+  and that a restarted sender does not reuse. `<aes67/sap.h>` builds and parses SAP packets for an
+  announcer with its own sockets. On Linux, receive
   uses `recvmmsg`, `epoll` and kernel timestamps. On Windows and macOS, every stream on a port shares one
   socket, and each packet is sorted to its stream by destination address. That way all streams can use
   5004, as real AES67 does.
@@ -40,7 +43,8 @@ add_subdirectory(path/to/meros-aes67)
 target_link_libraries(my_app PRIVATE meros::aes67 meros::mdns)
 ```
 
-Headers are included as `<aes67/rx.h>`, `<aes67/tx.h>`, `<aes67/sdp.h>`, `<aes67/rtp.h>`, `<aes67/netrx.h>` and
+Headers are included as `<aes67/rx.h>`, `<aes67/tx.h>`, `<aes67/sdp.h>`, `<aes67/sap.h>`, `<aes67/rtp.h>`,
+`<aes67/netrx.h>` and
 `<mdns/mdns.h>`.
 
 Used by Meros Inc. in its own audio-over-IP products.
