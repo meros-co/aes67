@@ -20,6 +20,11 @@ bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out
     return false;
 }
 
+const char *aes67_format_encoding(aes67_sample_format_t format)
+{
+    return format == AES67_FORMAT_L16 ? "L16" : format == AES67_FORMAT_AM824 ? "AM824" : "L24";
+}
+
 int aes67_rtp_write_rings(const uint8_t *packet, size_t len, uint8_t payload_type,
                           aes67_sample_format_t format, int channels, uint32_t media_clock_offset,
                           aes67_ring_t *rings, aes67_rtp_header_t *header)
@@ -60,6 +65,7 @@ int aes67_max_channels(int bytes_per_sample, int frames_per_packet)
 }
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define RING_MASK (AES67_RING_FRAMES - 1)
@@ -133,6 +139,39 @@ size_t aes67_rtp_pack_l24(uint8_t *packet, size_t cap, const aes67_rtp_header_t 
     return AES67_RTP_HEADER_BYTES + payload;
 }
 
+void aes67_i32_to_l16(int32_t v, uint8_t out[2])
+{
+    /* Round half up: add half of the dropped byte, then floor (by hand,
+       since C's division truncates toward zero for negative values). */
+    int32_t r = v + 128;
+    r = r >= 0 ? r / 256 : -((-r + 255) / 256);
+    if (r > 32767)
+        r = 32767;
+    else if (r < -32768)
+        r = -32768;
+    const uint16_t u = (uint16_t) (int16_t) r;
+    out[0] = (uint8_t) (u >> 8);
+    out[1] = (uint8_t) u;
+}
+
+size_t aes67_rtp_pack(uint8_t *packet, size_t cap, const aes67_rtp_header_t *h,
+                      aes67_sample_format_t format, const int32_t *interleaved, int frames,
+                      int channels)
+{
+    if (format == AES67_FORMAT_L24)
+        return aes67_rtp_pack_l24(packet, cap, h, interleaved, frames, channels);
+    if (format != AES67_FORMAT_L16 || packet == NULL || frames <= 0 || channels <= 0)
+        return 0;
+    const size_t payload = (size_t) frames * (size_t) channels * 2;
+    if (payload > AES67_MAX_PAYLOAD_BYTES || AES67_RTP_HEADER_BYTES + payload > cap)
+        return 0;
+    aes67_rtp_write_header(packet, h);
+    uint8_t *d = packet + AES67_RTP_HEADER_BYTES;
+    for (int i = 0; i < frames * channels; ++i, d += 2)
+        aes67_i32_to_l16(interleaved[i], d);
+    return AES67_RTP_HEADER_BYTES + payload;
+}
+
 /* ---- ring ----------------------------------------------------------------- */
 
 void aes67_ring_init(aes67_ring_t *r)
@@ -195,24 +234,33 @@ int aes67_sdp_write(char *buf, size_t len, const aes67_sdp_params_t *p)
         if (g[i] != 0)
             gm_known = true;
 
+    /* RFC 4566: a TTL belongs to an IPv4 multicast address (224/4) only. */
+    char ttl[8] = "";
+    if (p->group != NULL) {
+        const int first = atoi(p->group);
+        if (first >= 224 && first <= 239)
+            snprintf(ttl, sizeof ttl, "/%u", p->ttl ? p->ttl : 15);
+    }
+
     int n = snprintf(buf, len,
         "v=0\r\n"
         "o=- %u 0 IN IP4 %s\r\n"
         "s=%s\r\n"
-        "c=IN IP4 %s/%u\r\n"
+        "c=IN IP4 %s%s\r\n"
         "t=0 0\r\n"
         "a=clock-domain:PTPv2 %u\r\n"
         "m=audio %u RTP/AVP %u\r\n"
-        "a=rtpmap:%u L24/%u/%u\r\n"
+        "a=rtpmap:%u %s/%u/%u\r\n"
         "a=sync-time:0\r\n"
         "a=ptime:%.3f\r\n"
         "a=mediaclk:direct=0\r\n",
         p->ssrc, p->origin_ip ? p->origin_ip : "0.0.0.0",
         p->session_name && p->session_name[0] ? p->session_name : "aes67",
-        p->group, p->ttl ? p->ttl : 15,
+        p->group, ttl,
         p->ptp_domain,
         p->port, p->payload_type,
-        p->payload_type, p->sample_rate ? p->sample_rate : 48000, p->channels,
+        p->payload_type, aes67_format_encoding(p->format),
+        p->sample_rate ? p->sample_rate : 48000, p->channels,
         ptime_ms);
     if (n < 0)
         return n;
@@ -229,5 +277,15 @@ int aes67_sdp_write(char *buf, size_t len, const aes67_sdp_params_t *p)
     else
         m = snprintf(buf + (n < (int) len ? n : (int) len), n < (int) len ? len - (size_t) n : 0,
                      "a=ts-refclk:ptp=IEEE1588-2008:traceable\r\n");
-    return m < 0 ? m : n + m;
+    if (m < 0)
+        return m;
+    n += m;
+    if (p->channel_order != NULL && p->channel_order[0] != '\0') {
+        m = snprintf(buf + (n < (int) len ? n : (int) len), n < (int) len ? len - (size_t) n : 0,
+                     "a=fmtp:%u channel-order=%s\r\n", p->payload_type, p->channel_order);
+        if (m < 0)
+            return m;
+        n += m;
+    }
+    return n;
 }

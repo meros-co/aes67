@@ -107,6 +107,21 @@ typedef enum aes67_sample_format {
 int  aes67_format_bytes(aes67_sample_format_t format);
 bool aes67_format_from_encoding(const char *encoding, aes67_sample_format_t *out);
 
+/* The rtpmap encoding name of a format: "L24", "L16" or "AM824". */
+const char *aes67_format_encoding(aes67_sample_format_t format);
+
+/* A right-justified 24-bit sample as network-order L16: rounded to the
+   nearest 16-bit value and clamped, so a sample that came from L16 (a
+   multiple of 256, as the receive side scales it) goes back unchanged. */
+void aes67_i32_to_l16(int32_t v, uint8_t out[2]);
+
+/* aes67_rtp_pack_l24 for any format this library sends: L24 or L16. The
+   packet length, or 0 when it would not fit or the format is AM824, which
+   is received but not sent. */
+size_t aes67_rtp_pack(uint8_t *packet, size_t cap, const aes67_rtp_header_t *h,
+                      aes67_sample_format_t format, const int32_t *interleaved, int frames,
+                      int channels);
+
 /* ---- a received packet into rings ---------------------------------------
  *
  * The decode step on its own, for a receiver that owns its sockets and its
@@ -168,11 +183,18 @@ typedef struct aes67_sdp_params {
        zero when unknown, which a receiver should read as "not stated". */
     uint8_t     gm_identity[8];
     uint16_t    ptp_domain;
+    /* Added later, at the end, so a zeroed struct reads as before. */
+    aes67_sample_format_t format;   /* the rtpmap encoding; zero is L24 */
+    /* The ST 2110-30 channel order, written as a=fmtp:<pt> channel-order=
+       when set, for example "SMPTE2110.(ST)"; NULL or empty writes none. */
+    const char *channel_order;
 } aes67_sdp_params_t;
 
 /* Generates an AES67 SDP (RFC 4566 + the AES67 attributes a receiver
-   needs: rtpmap, ptime, mediaclk, ts-refclk). Returns the length it wrote,
-   or would have written, snprintf-style. */
+   needs: rtpmap, ptime, mediaclk, ts-refclk). The c= line carries the TTL
+   only when `group` is a multicast address, as RFC 4566 asks; a unicast
+   destination has none. Returns the length it wrote, or would have written,
+   snprintf-style. */
 int aes67_sdp_write(char *buf, size_t len, const aes67_sdp_params_t *p);
 
 #ifdef __cplusplus

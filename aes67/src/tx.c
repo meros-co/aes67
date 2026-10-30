@@ -115,7 +115,12 @@ aes67_tx_t *aes67_tx_open(const aes67_tx_cfg_t *cfg, char *errbuf, size_t errlen
         const uint32_t ptime = s->cfg.ptime_us ? s->cfg.ptime_us : 1000;
         /* Rounded, as a sender counts them: 125 us at 44.1 kHz is 6 frames. */
         const int frames = (int) (((uint64_t) rate * ptime + 500000u) / 1000000u);
-        const int fits = aes67_max_channels(3, frames);
+        if (s->cfg.format != AES67_FORMAT_L24 && s->cfg.format != AES67_FORMAT_L16) {
+            snprintf(errbuf, errlen, "stream %d: only L24 and L16 are sent", i);
+            aes67_tx_close(tx);
+            return NULL;
+        }
+        const int fits = aes67_max_channels(aes67_format_bytes(s->cfg.format), frames);
         if (s->cfg.channels == 0 || s->cfg.channels > fits) {
             snprintf(errbuf, errlen, "stream %d: %u channels do not fit a %u us packet (up to %d)",
                      i, s->cfg.channels, ptime, fits);
@@ -160,7 +165,7 @@ size_t aes67_tx_build(aes67_tx_t *tx, int stream, const int32_t *interleaved, in
     h.sequence = s->seq;
     h.timestamp = ts;
     h.ssrc = s->ssrc;
-    const size_t n = aes67_rtp_pack_l24(packet, cap, &h, interleaved, frames, s->cfg.channels);
+    const size_t n = aes67_rtp_pack(packet, cap, &h, s->cfg.format, interleaved, frames, s->cfg.channels);
     if (n > 0)
         s->seq++;
     return n;
@@ -215,6 +220,7 @@ int aes67_tx_sdp(aes67_tx_t *tx, int stream, char *buf, size_t len)
     p.ttl = tx->cfg.ttl;
     memcpy(p.gm_identity, tx->cfg.gm_identity, sizeof p.gm_identity);
     p.ptp_domain = tx->cfg.ptp_domain;
+    p.format = s->cfg.format;
     return aes67_sdp_write(buf, len, &p);
 }
 

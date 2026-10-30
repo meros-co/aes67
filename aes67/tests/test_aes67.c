@@ -1172,8 +1172,113 @@ static void test_identifiers_are_never_reused(void)
             CHECK(seen_ssrc[i] != seen_ssrc[j]);
 }
 
+/* L16 out: rounded from 24 bits, clamped, framed, announced as L16, and read
+   back by the receive path at 24-bit scale. */
+static void test_transmit_l16(void)
+{
+    uint8_t b[2];
+    aes67_i32_to_l16(0x123456, b);            /* 0x1234.56 rounds down */
+    CHECK(b[0] == 0x12 && b[1] == 0x34);
+    aes67_i32_to_l16(0x123480, b);            /* half rounds up */
+    CHECK(b[0] == 0x12 && b[1] == 0x35);
+    aes67_i32_to_l16(-256, b);                /* exact multiples go back unchanged */
+    CHECK(b[0] == 0xFF && b[1] == 0xFF);
+    aes67_i32_to_l16(-129, b);
+    CHECK(b[0] == 0xFF && b[1] == 0xFF);
+    aes67_i32_to_l16(0x7FFFFF, b);            /* clamped, not wrapped */
+    CHECK(b[0] == 0x7F && b[1] == 0xFF);
+    aes67_i32_to_l16(-0x800000, b);
+    CHECK(b[0] == 0x80 && b[1] == 0x00);
+    CHECK(strcmp(aes67_format_encoding(AES67_FORMAT_L16), "L16") == 0);
+    CHECK(strcmp(aes67_format_encoding(AES67_FORMAT_L24), "L24") == 0);
+
+    aes67_tx_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.stream_count = 1;
+    strcpy(cfg.streams[0].group, "239.69.1.5");
+    cfg.streams[0].port = 5004;
+    cfg.streams[0].payload_type = 96;
+    cfg.streams[0].channels = 15;             /* 15 x 48 x 2 = 1440: fits L16, not L24 */
+    cfg.streams[0].format = AES67_FORMAT_L16;
+    char err[160] = { 0 };
+    aes67_tx_t *tx = aes67_tx_open(&cfg, err, sizeof err);
+    CHECK(tx != NULL);
+    if (tx == NULL) {
+        printf("  L16 transmit: %s\n", err);
+        return;
+    }
+    int32_t frames[48 * 15];
+    for (int i = 0; i < 48 * 15; ++i)
+        frames[i] = (i - 360) * 256;
+    uint8_t pkt[1500];
+    const size_t n = aes67_tx_build(tx, 0, frames, 48, 4800, pkt, sizeof pkt);
+    CHECK(n == 12 + 48 * 15 * 2);
+    aes67_ring_t *rings = calloc(15, sizeof *rings);
+    CHECK(rings != NULL);
+    if (rings != NULL) {
+        for (int c = 0; c < 15; ++c)
+            aes67_ring_init(&rings[c]);
+        CHECK(aes67_rtp_write_rings(pkt, n, 96, AES67_FORMAT_L16, 15, 0, rings, NULL) == 48);
+        int32_t out[48];
+        CHECK(aes67_ring_read(&rings[3], 4800, out, 48) == 48);
+        CHECK(out[0] == (3 - 360) * 256 && out[47] == (47 * 15 + 3 - 360) * 256);
+        free(rings);
+    }
+    char sdp[1024];
+    CHECK(aes67_tx_sdp(tx, 0, sdp, sizeof sdp) > 0);
+    CHECK(strstr(sdp, "a=rtpmap:96 L16/48000/15\r\n") != NULL);
+    aes67_sdp_t parsed;
+    CHECK(aes67_sdp_parse(sdp, strlen(sdp), &parsed, err, sizeof err));
+    CHECK(strcmp(parsed.encoding, "L16") == 0 && parsed.channels == 15);
+    aes67_tx_close(tx);
+
+    cfg.streams[0].format = AES67_FORMAT_L24;     /* the same stream does not fit L24 */
+    tx = aes67_tx_open(&cfg, err, sizeof err);
+    CHECK(tx == NULL && strstr(err, "do not fit") != NULL);
+    cfg.streams[0].channels = 2;
+    cfg.streams[0].format = AES67_FORMAT_AM824;   /* received, never sent */
+    tx = aes67_tx_open(&cfg, err, sizeof err);
+    CHECK(tx == NULL && strstr(err, "L24 and L16") != NULL);
+    CHECK(aes67_rtp_pack(pkt, sizeof pkt, &(aes67_rtp_header_t) { 96, false, 0, 0, 0 },
+                         AES67_FORMAT_AM824, frames, 1, 2) == 0);
+}
+
+/* A unicast destination's c= has no TTL; a channel order is written when
+   asked for and not otherwise. */
+static void test_sdp_unicast_and_channel_order(void)
+{
+    aes67_sdp_params_t p;
+    memset(&p, 0, sizeof p);
+    p.session_name = "Desk";
+    p.origin_ip = "10.0.0.5";
+    p.group = "10.0.0.9";
+    p.port = 5004;
+    p.payload_type = 97;
+    p.channels = 2;
+    p.ptime_us = 1000;
+    p.ttl = 32;
+    char sdp[1024];
+    aes67_sdp_write(sdp, sizeof sdp, &p);
+    CHECK(strstr(sdp, "c=IN IP4 10.0.0.9\r\n") != NULL);
+    CHECK(strstr(sdp, "a=fmtp") == NULL);
+    p.group = "239.1.2.3";
+    p.channel_order = "SMPTE2110.(ST)";
+    const int n = aes67_sdp_write(sdp, sizeof sdp, &p);
+    CHECK(strstr(sdp, "c=IN IP4 239.1.2.3/32\r\n") != NULL);
+    CHECK(strstr(sdp, "a=fmtp:97 channel-order=SMPTE2110.(ST)\r\n") != NULL);
+    CHECK(n == (int) strlen(sdp));
+    char err[64];
+    aes67_sdp_t parsed;
+    CHECK(aes67_sdp_parse(sdp, strlen(sdp), &parsed, err, sizeof err));
+    CHECK(strcmp(parsed.channel_order, "SMPTE2110.(ST)") == 0);
+    char tiny[40];
+    CHECK(aes67_sdp_write(tiny, sizeof tiny, &p) == n);   /* snprintf-style, with the fmtp too */
+}
+
 int main(void)
 {
+    test_transmit_l16();
+    test_sdp_unicast_and_channel_order();
     test_identifiers_are_never_reused();
     test_sdp_names_every_2110_essence();
     test_receive_decodes_l16_and_am824();

@@ -4,7 +4,7 @@
 #ifndef MEROS_AES67_TX_H
 #define MEROS_AES67_TX_H
 
-/* libaes67 transmit: frames in, RTP/L24 multicast packets out, plus the SDP
+/* libaes67 transmit: frames in, RTP L24 or L16 packets out, plus the SDP
  * that makes the stream subscribable and a SAP announcer for receivers that
  * have no NMOS.
  *
@@ -36,6 +36,8 @@ typedef struct aes67_tx_stream_cfg {
     uint32_t ptime_us;        /* 1000, 250, 125 */
     uint32_t sample_rate;     /* 48000 default */
     char     name[64];        /* session name for the SDP */
+    /* Added later, at the end, so a zeroed config reads as before. */
+    aes67_sample_format_t format;   /* L24 (zero) or L16; AM824 is refused */
 } aes67_tx_stream_cfg_t;
 
 typedef struct aes67_tx_cfg {
@@ -53,8 +55,9 @@ typedef struct aes67_tx aes67_tx_t;
 aes67_tx_t *aes67_tx_open(const aes67_tx_cfg_t *cfg, char *errbuf, size_t errlen);
 
 /* Sends one packet-time of frames for a stream: `frames` x channels of
-   right-justified 24-bit samples, `ts` the media-clock timestamp of the first
-   frame. False when the packet would not fit or the send failed. */
+   right-justified 24-bit samples (an L16 stream rounds them to 16), `ts` the
+   media-clock timestamp of the first frame. False when the packet would not
+   fit or the send failed. */
 bool aes67_tx_send(aes67_tx_t *tx, int stream, const int32_t *interleaved, int frames, uint32_t ts);
 
 /* Builds the packet without sending it -- what the tests check, and what a
