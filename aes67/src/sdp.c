@@ -318,7 +318,7 @@ bool aes67_sdp_parse(const char *text, size_t len, aes67_sdp_t *out, char *errbu
         return false;
     }
 
-    parse_state_t st = { out, false, false, false };
+    parse_state_t st = { .out = out };   /* the rest zero */
     size_t pos = 0;
     while (pos < len) {
         const char *line = text + pos;
