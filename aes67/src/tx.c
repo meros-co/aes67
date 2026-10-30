@@ -130,8 +130,9 @@ aes67_tx_t *aes67_tx_open(const aes67_tx_cfg_t *cfg, char *errbuf, size_t errlen
         s->dst.sin_family = AF_INET;
         s->dst.sin_port = htons(s->cfg.port);
         s->dst.sin_addr.s_addr = inet_addr(s->cfg.group);
-        s->ssrc = 0x3AE50000u | (uint32_t) i;   /* stable and recognisable in a capture */
-        s->sap_hash = (uint16_t) (0xAE50u + i);
+        /* Never reused: not by another stream, nor by this sender's last run. */
+        s->ssrc = aes67_new_ssrc();
+        s->sap_hash = aes67_new_sap_hash();
     }
 
     if (cfg->announce_sap) {

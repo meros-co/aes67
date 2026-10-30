@@ -1098,8 +1098,83 @@ static void test_wide_streams_are_bounded_by_the_packet(void)
     aes67_rx_close(rx);
 }
 
+/* SSRCs and SAP hashes are never handed out twice, and a transmitter's
+   streams take fresh ones every time it opens. */
+static void test_identifiers_are_never_reused(void)
+{
+    enum { N = 65535 };
+    uint8_t *seen = calloc(65536, 1);
+    uint32_t *ssrcs = malloc(N * sizeof *ssrcs);
+    CHECK(seen != NULL && ssrcs != NULL);
+    if (seen == NULL || ssrcs == NULL) {
+        free(seen);
+        free(ssrcs);
+        return;
+    }
+    int repeats = 0, zeros = 0;
+    for (int i = 0; i < N; ++i) {
+        const uint16_t h = aes67_new_sap_hash();
+        zeros += h == 0;
+        repeats += seen[h];
+        seen[h] = 1;
+    }
+    CHECK(zeros == 0);
+    CHECK(repeats == 0);   /* a whole period of 65535 nonzero hashes, each once */
+
+    /* SSRCs: shell-sorted, then no two neighbors equal. */
+    for (int i = 0; i < N; ++i)
+        ssrcs[i] = aes67_new_ssrc();
+    for (int gap = N / 2; gap > 0; gap /= 2)
+        for (int i = gap; i < N; ++i) {
+            const uint32_t v = ssrcs[i];
+            int j = i;
+            for (; j >= gap && ssrcs[j - gap] > v; j -= gap)
+                ssrcs[j] = ssrcs[j - gap];
+            ssrcs[j] = v;
+        }
+    int dupes = 0;
+    for (int i = 1; i < N; ++i)
+        dupes += ssrcs[i] == ssrcs[i - 1];
+    CHECK(dupes == 0);
+    free(seen);
+    free(ssrcs);
+
+    aes67_tx_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.stream_count = 2;
+    for (int i = 0; i < 2; ++i) {
+        strcpy(cfg.streams[i].group, "239.69.1.4");
+        cfg.streams[i].port = (uint16_t) (5004 + i);
+        cfg.streams[i].payload_type = 98;
+        cfg.streams[i].channels = 2;
+    }
+    char err[128] = { 0 };
+    uint32_t seen_ssrc[4];
+    for (int open = 0; open < 2; ++open) {
+        aes67_tx_t *tx = aes67_tx_open(&cfg, err, sizeof err);
+        CHECK(tx != NULL);
+        if (tx == NULL) {
+            printf("  identifiers: %s\n", err);
+            return;
+        }
+        int32_t frames[48 * 2] = { 0 };
+        uint8_t pkt[1500];
+        for (int i = 0; i < 2; ++i) {
+            aes67_rtp_header_t h;
+            const size_t n = aes67_tx_build(tx, i, frames, 48, 0, pkt, sizeof pkt);
+            CHECK(aes67_rtp_parse_header(pkt, n, &h));
+            seen_ssrc[open * 2 + i] = h.ssrc;
+        }
+        aes67_tx_close(tx);
+    }
+    for (int i = 0; i < 4; ++i)
+        for (int j = i + 1; j < 4; ++j)
+            CHECK(seen_ssrc[i] != seen_ssrc[j]);
+}
+
 int main(void)
 {
+    test_identifiers_are_never_reused();
     test_sdp_names_every_2110_essence();
     test_receive_decodes_l16_and_am824();
     test_media_clock_is_ptp_time();

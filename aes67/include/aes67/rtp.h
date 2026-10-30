@@ -133,6 +133,24 @@ int aes67_rtp_write_rings(const uint8_t *packet, size_t len, uint8_t payload_typ
                           aes67_sample_format_t format, int channels, uint32_t media_clock_offset,
                           aes67_ring_t *rings, aes67_rtp_header_t *header);
 
+/* ---- identifiers ----------------------------------------------------------
+ *
+ * The numbers a sender must never reuse. Each comes from a counter run
+ * through a permutation keyed, once per process, by the operating system's
+ * random generator: unpredictable as RFC 3550 asks, distinct from every
+ * other this process has issued, and unrelated to the last run's, so a
+ * restarted sender does not reappear under its old identity. Thread-safe.
+ */
+
+/* A fresh RTP SSRC. Not repeated within a process until 2^32 have been
+   issued. */
+uint32_t aes67_new_ssrc(void);
+
+/* A fresh SAP message id hash (RFC 2974): never zero, and not repeated
+   within a process until 65535 have been issued. An announcer takes a new
+   one whenever the SDP it announces changes. */
+uint16_t aes67_new_sap_hash(void);
+
 /* ---- SDP ----------------------------------------------------------------- */
 
 typedef struct aes67_sdp_params {
