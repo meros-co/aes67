@@ -70,7 +70,12 @@ size_t aes67_rtp_pack_l24(uint8_t *packet, size_t cap, const aes67_rtp_header_t 
  * packet arriving out of order lands in the right place regardless.
  */
 
-#define AES67_RING_FRAMES 4096   /* power of two; ~85 ms at 48 kHz */
+/* Frames per ring, a power of two: how far behind the newest packet a reader
+   can sit. ~85 ms at 48 kHz unless the build sets MEROS_AES67_RING_FRAMES,
+   which defines this for the library and everything linking it alike. */
+#ifndef AES67_RING_FRAMES
+#define AES67_RING_FRAMES 4096
+#endif
 
 typedef struct aes67_ring {
     int32_t samples[AES67_RING_FRAMES];

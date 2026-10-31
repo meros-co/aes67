@@ -20,6 +20,11 @@ add_library(meros_aes67 STATIC
 add_library(meros::aes67 ALIAS meros_aes67)
 
 target_include_directories(meros_aes67 PUBLIC include)
+# The playout ring's length (aes67_ring_t), public: the library and its users
+# must agree on it. A consumer whose readers sit far behind the network (a long
+# link offset, large host periods) raises it before adding this directory.
+set(MEROS_AES67_RING_FRAMES 4096 CACHE STRING "Frames per playout ring: a power of two, at least 1024")
+target_compile_definitions(meros_aes67 PUBLIC AES67_RING_FRAMES=${MEROS_AES67_RING_FRAMES})
 set_target_properties(meros_aes67 PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON

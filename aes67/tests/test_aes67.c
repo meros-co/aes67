@@ -125,6 +125,17 @@ static void test_ring_is_timestamp_indexed(void)
     aes67_ring_write(&r, 1008 - AES67_RING_FRAMES - 1, 99);
     CHECK((uint32_t) aes67_atomic_load(&r.late_drops, AES67_MO_SEQ_CST) == 1);
 
+    /* A reader a whole ring behind the head reads every frame, whatever
+       length the build gave the ring; one frame further is gone. */
+    aes67_ring_init(&r);
+    for (uint32_t t = 0; t < 2 * AES67_RING_FRAMES; ++t)
+        aes67_ring_write(&r, 5000 + t, (int32_t) t);
+    {
+        const uint32_t oldest = 5000 + AES67_RING_FRAMES;
+        CHECK(aes67_ring_read(&r, oldest, out, 1) == 1 && out[0] == (int32_t) AES67_RING_FRAMES);
+        CHECK(aes67_ring_read(&r, oldest - 1, out, 1) == 0 && out[0] == 0);
+    }
+
     /* Timestamps wrap at 2^32 and the ring does not care. */
     aes67_ring_init(&r);
     aes67_ring_write(&r, 0xFFFFFFFEu, 1);

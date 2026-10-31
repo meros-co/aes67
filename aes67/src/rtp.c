@@ -69,6 +69,8 @@ int aes67_max_channels(int bytes_per_sample, int frames_per_packet)
 #include <string.h>
 
 #define RING_MASK (AES67_RING_FRAMES - 1)
+_Static_assert(AES67_RING_FRAMES >= 1024 && (AES67_RING_FRAMES & RING_MASK) == 0,
+               "AES67_RING_FRAMES is a power of two of at least 1024");
 
 /* ---- RTP ------------------------------------------------------------------ */
 
