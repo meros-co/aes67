@@ -328,6 +328,22 @@ static void test_netrx_sorts_one_port(void)
     CHECK(aes67_ring_read(&b[0], 9002, out, 1) == 0);
     CHECK(aes67_netrx_add_stream(rx, &cb, err, sizeof err) >= 0);          /* and it can come back */
 
+    /* Timed against a media clock that read frame 5000 at 1 s: frame 5000
+       (RTP 6000) arriving 1 ms later is 48 frames after its time, 3 ms later
+       144, which is late against 96. */
+    aes67_netrx_get_stats(rx, sa, &st);
+    CHECK(!st.timed && st.late == 0);
+    aes67_netrx_set_media_clock(rx, sa, 1000000000u, 5000, 48000, 96);
+    n = build_packet(pkt, sizeof pkt, 96, 6, 6000, 2, 2, 1);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 1001000000u);
+    n = build_packet(pkt, sizeof pkt, 96, 7, 6000, 2, 2, 1);
+    aes67_netrx_inject(rx, src, ip4("239.69.1.1"), 5004, pkt, n, 1003000000u);
+    aes67_netrx_get_stats(rx, sa, &st);
+    CHECK(st.timed && st.offset_last == 144 && st.offset_min == 48 && st.offset_max == 144 && st.late == 1);
+    aes67_netrx_set_media_clock(rx, sa, 0, 0, 0, 0);                        /* unknown again */
+    aes67_netrx_get_stats(rx, sa, &st);
+    CHECK(!st.timed && st.late == 1);
+
     aes67_netrx_close(rx);
     free(a); free(b); free(c);
 }

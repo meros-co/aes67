@@ -56,6 +56,14 @@ typedef struct aes67_netrx_stats {
     uint64_t last_arrival_ns;          /* monotonic; 0 = nothing yet */
     uint16_t last_seq;
     bool     last_seq_valid;
+    /* Timed against the receiver's media clock (aes67_netrx_set_media_clock):
+       how long after its first sample's media-clock time each packet arrived,
+       in frames (the last, and the least and most since the stream was added
+       or the clock last set unknown), and the packets that arrived later than
+       `late_after` frames. */
+    bool     timed;
+    int64_t  offset_last, offset_min, offset_max;
+    uint64_t late;
 } aes67_netrx_stats_t;
 
 typedef struct aes67_netrx aes67_netrx_t;
@@ -80,6 +88,16 @@ bool aes67_netrx_start(aes67_netrx_t *rx);
 void aes67_netrx_stop(aes67_netrx_t *rx);
 
 void aes67_netrx_get_stats(aes67_netrx_t *rx, int slot, aes67_netrx_stats_t *out);
+
+/* The receiver's media clock, for timing a stream's arrivals: at
+   `at_ns` (aes67_netrx_now_ns) it read `media` frames at `rate` Hz, the
+   stream's rate. Set it again now and then, as the clocks drift apart;
+   `rate` 0: unknown (another grandmaster, say), and the timing stops.
+   `late_after`: frames after which a packet counts as late. */
+void aes67_netrx_set_media_clock(aes67_netrx_t *rx, int slot, uint64_t at_ns, uint64_t media, uint32_t rate,
+                                 uint32_t late_after);
+/* The clock arrivals are stamped on (monotonic nanoseconds). */
+uint64_t aes67_netrx_now_ns(void);
 /* Datagrams that reached these sockets for no stream here. */
 uint64_t aes67_netrx_foreign_packets(aes67_netrx_t *rx);
 

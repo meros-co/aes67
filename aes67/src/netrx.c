@@ -52,6 +52,11 @@ typedef struct netrx_slot {
 
     /* Written by the receive thread, read by anyone. */
     aes67_atomic_u64 packets, bytes, lost, reordered, wrong_pt, malformed, jitter_worst, last_arrival_ns, seq;
+
+    /* The media clock, set by anyone and read by the receive thread under a
+       sequence count (odd while it is written), and the arrival timing. */
+    aes67_atomic_u64 clk_seq, clk_at, clk_media, clk_rate_late;   /* rate << 32 | late_after */
+    aes67_atomic_u64 timed, offset_last, offset_min, offset_max, late;
 } netrx_slot_t;
 
 #if defined(_WIN32)
@@ -117,6 +122,39 @@ static bool is_multicast(uint32_t addr_net)
 
 /* ---- the packet path ------------------------------------------------------- */
 
+/* How late after its media-clock time `frame` arrived, against the slot's
+   media clock (when it has one). */
+static void time_arrival(netrx_slot_t *s, uint32_t frame, uint64_t arrival)
+{
+    uint64_t seq, at, media, rate_late;
+    do {
+        seq = aes67_atomic_load(&s->clk_seq, AES67_MO_ACQUIRE);
+        at = LOAD(&s->clk_at);
+        media = LOAD(&s->clk_media);
+        rate_late = LOAD(&s->clk_rate_late);
+    } while ((seq & 1) != 0 || aes67_atomic_load(&s->clk_seq, AES67_MO_ACQUIRE) != seq);
+    const uint32_t rate = (uint32_t) (rate_late >> 32), late_after = (uint32_t) rate_late;
+    if (rate == 0)
+        return;
+    const int64_t since = (int64_t) (arrival - at);
+    const uint64_t now = media + (uint64_t) (since / 1000000000 * (int64_t) rate
+                                             + since % 1000000000 * (int64_t) rate / 1000000000);
+    const int64_t offset = (int32_t) ((uint32_t) now - frame);
+    aes67_atomic_store(&s->offset_last, (uint64_t) offset, AES67_MO_RELAXED);
+    if (LOAD(&s->timed) == 0) {
+        aes67_atomic_store(&s->offset_min, (uint64_t) offset, AES67_MO_RELAXED);
+        aes67_atomic_store(&s->offset_max, (uint64_t) offset, AES67_MO_RELAXED);
+        aes67_atomic_store(&s->timed, 1, AES67_MO_RELEASE);
+    } else {
+        if (offset < (int64_t) LOAD(&s->offset_min))
+            aes67_atomic_store(&s->offset_min, (uint64_t) offset, AES67_MO_RELAXED);
+        if (offset > (int64_t) LOAD(&s->offset_max))
+            aes67_atomic_store(&s->offset_max, (uint64_t) offset, AES67_MO_RELAXED);
+    }
+    if (offset > (int64_t) late_after)
+        BUMP(&s->late, 1);
+}
+
 static void process(aes67_netrx_t *rx, uint32_t src, uint32_t dst, uint16_t port, const uint8_t *p, size_t len,
                     uint64_t arrival)
 {
@@ -160,6 +198,7 @@ static void process(aes67_netrx_t *rx, uint32_t src, uint32_t dst, uint16_t port
         }
         s->last_arrival = arrival;
         aes67_atomic_store(&s->last_arrival_ns, arrival, AES67_MO_RELAXED);
+        time_arrival(s, h.timestamp - c->media_clock_offset, arrival);
         BUMP(&s->packets, 1);
         BUMP(&s->bytes, (uint64_t) len);
         return;   /* one stream per (group, port, source) */
@@ -516,7 +555,8 @@ int aes67_netrx_add_stream(aes67_netrx_t *rx, const aes67_netrx_stream_cfg_t *cf
     s->last_seq = 0;
     s->last_arrival = 0;
     aes67_atomic_u64 *counters[] = { &s->packets, &s->bytes, &s->lost, &s->reordered, &s->wrong_pt,
-                                     &s->malformed, &s->jitter_worst, &s->last_arrival_ns, &s->seq };
+                                     &s->malformed, &s->jitter_worst, &s->last_arrival_ns, &s->seq,
+                                     &s->clk_rate_late, &s->timed, &s->late };
     for (size_t i = 0; i < sizeof counters / sizeof counters[0]; ++i)
         aes67_atomic_store(counters[i], 0, AES67_MO_RELAXED);
     aes67_atomic_store(&s->state, SLOT_ACTIVE, AES67_MO_RELEASE);
@@ -637,6 +677,37 @@ void aes67_netrx_get_stats(aes67_netrx_t *rx, int slot, aes67_netrx_stats_t *out
     const uint64_t seq = LOAD(&s->seq);
     out->last_seq_valid = (seq & 0x10000u) != 0;
     out->last_seq = (uint16_t) seq;
+    out->timed = aes67_atomic_load(&s->timed, AES67_MO_ACQUIRE) != 0;
+    if (out->timed) {
+        out->offset_last = (int64_t) LOAD(&s->offset_last);
+        out->offset_min = (int64_t) LOAD(&s->offset_min);
+        out->offset_max = (int64_t) LOAD(&s->offset_max);
+    }
+    out->late = LOAD(&s->late);
+}
+
+void aes67_netrx_set_media_clock(aes67_netrx_t *rx, int slot, uint64_t at_ns, uint64_t media, uint32_t rate,
+                                 uint32_t late_after)
+{
+    if (rx == NULL || slot < 0 || slot >= AES67_NETRX_MAX_STREAMS)
+        return;
+    netrx_slot_t *s = &rx->slots[slot];
+    aes67_mutex_lock(&rx->control);   /* one writer at a time */
+    const uint64_t seq = LOAD(&s->clk_seq);
+    aes67_atomic_store(&s->clk_seq, seq + 1, AES67_MO_SEQ_CST);
+    aes67_atomic_store(&s->clk_at, at_ns, AES67_MO_RELAXED);
+    aes67_atomic_store(&s->clk_media, media, AES67_MO_RELAXED);
+    aes67_atomic_store(&s->clk_rate_late, (uint64_t) rate << 32 | late_after, AES67_MO_RELAXED);
+    aes67_atomic_store(&s->clk_seq, seq + 2, AES67_MO_RELEASE);
+    /* An unknown clock: the next known one starts the least and most anew. */
+    if (rate == 0)
+        aes67_atomic_store(&s->timed, 0, AES67_MO_RELAXED);
+    aes67_mutex_unlock(&rx->control);
+}
+
+uint64_t aes67_netrx_now_ns(void)
+{
+    return aes67_now_ns();
 }
 
 uint64_t aes67_netrx_foreign_packets(aes67_netrx_t *rx)
