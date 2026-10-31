@@ -125,6 +125,24 @@ static void test_ring_is_timestamp_indexed(void)
     aes67_ring_write(&r, 1008 - AES67_RING_FRAMES - 1, 99);
     CHECK((uint32_t) aes67_atomic_load(&r.late_drops, AES67_MO_SEQ_CST) == 1);
 
+    /* A packet that never came reads as missing, not as what its slots held a
+       lap earlier; samples keep 24 bits and their sign. */
+    aes67_ring_init(&r);
+    for (uint32_t t = 0; t < AES67_RING_FRAMES + 48; ++t)
+        if (t < AES67_RING_FRAMES + 16 || t >= AES67_RING_FRAMES + 32)
+            aes67_ring_write(&r, 10 + t, -(int32_t) t);
+    {
+        int32_t span[48];
+        CHECK(aes67_ring_read(&r, 10 + AES67_RING_FRAMES, span, 48) == 32);
+        CHECK(span[0] == -(int32_t) AES67_RING_FRAMES && span[15] == -(int32_t) (AES67_RING_FRAMES + 15));
+        CHECK(span[16] == 0 && span[31] == 0);
+        CHECK(span[32] == -(int32_t) (AES67_RING_FRAMES + 32));
+        aes67_ring_write(&r, 10 + AES67_RING_FRAMES + 20, 0x7FFFFF);
+        aes67_ring_write(&r, 10 + AES67_RING_FRAMES + 21, 0x12345678);   /* more than 24 bits */
+        CHECK(aes67_ring_read(&r, 10 + AES67_RING_FRAMES + 20, span, 2) == 2);
+        CHECK(span[0] == 0x7FFFFF && span[1] == 0x345678);
+    }
+
     /* A reader a whole ring behind the head reads every frame, whatever
        length the build gave the ring; one frame further is gone. */
     aes67_ring_init(&r);

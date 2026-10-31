@@ -78,6 +78,8 @@ size_t aes67_rtp_pack_l24(uint8_t *packet, size_t cap, const aes67_rtp_header_t 
 #endif
 
 typedef struct aes67_ring {
+    /* The 24-bit sample, and above it which lap of the ring wrote it, so a
+       slot a lost packet left from the last lap reads as missing. */
     int32_t samples[AES67_RING_FRAMES];
     /* Highest timestamp written + 1: the next frame the writer expects. */
     aes67_atomic_u64 head_ts;
@@ -86,12 +88,14 @@ typedef struct aes67_ring {
 
 void aes67_ring_init(aes67_ring_t *r);
 
-/* Writer. A sample older than a whole ring behind the head is dropped as
-   stale rather than overwriting what the reader is about to play. */
+/* Writer. Keeps the sample's low 24 bits (an L24 word; L16 and AM824 decode
+   to the same). A sample older than a whole ring behind the head is dropped
+   as stale rather than overwriting what the reader is about to play. */
 void aes67_ring_write(aes67_ring_t *r, uint32_t ts, int32_t sample);
 
-/* Reader, wait-free. Fills out[] with the frames at ts..ts+frames-1 that are
-   present and zero for the ones that are not (concealment is the caller's
+/* Reader, wait-free. Fills out[] with the frames at ts..ts+frames-1 that were
+   written (sign-extended 24-bit samples) and zero for the ones that were not:
+   not yet arrived, a whole ring behind, or lost (concealment is the caller's
    policy); returns how many were present. */
 int aes67_ring_read(const aes67_ring_t *r, uint32_t ts, int32_t *out, int frames);
 

@@ -72,6 +72,14 @@ int aes67_max_channels(int bytes_per_sample, int frames_per_packet)
 _Static_assert(AES67_RING_FRAMES >= 1024 && (AES67_RING_FRAMES & RING_MASK) == 0,
                "AES67_RING_FRAMES is a power of two of at least 1024");
 
+/* A stored sample's top byte: written (0x80) and the ring's lap, timestamp /
+   ring length, modulo 128. A slot from an earlier lap -- a packet that never
+   came -- does not match. Zeroed by init, so nothing reads as written. */
+static uint32_t ring_tag(uint32_t ts)
+{
+    return 0x80u | ((ts / AES67_RING_FRAMES) & 0x7Fu);
+}
+
 /* ---- RTP ------------------------------------------------------------------ */
 
 void aes67_rtp_write_header(uint8_t out[AES67_RTP_HEADER_BYTES], const aes67_rtp_header_t *h)
@@ -192,7 +200,7 @@ void aes67_ring_write(aes67_ring_t *r, uint32_t ts, int32_t sample)
         aes67_atomic_fetch_add(&r->late_drops, 1, AES67_MO_RELAXED);
         return;
     }
-    r->samples[ts & RING_MASK] = sample;
+    r->samples[ts & RING_MASK] = (int32_t) ((ring_tag(ts) << 24) | ((uint32_t) sample & 0xFFFFFFu));
     aes67_atomic_fetch_add(&r->writes, 1, AES67_MO_RELAXED);
     /* An empty ring (head 0) takes whatever timestamp comes first. Senders
        start RTP timestamps at random (GStreamer, most devices); half of
@@ -209,9 +217,10 @@ int aes67_ring_read(const aes67_ring_t *r, uint32_t ts, int32_t *out, int frames
     int have = 0;
     for (int f = 0; f < frames; ++f) {
         const uint32_t t = ts + (uint32_t) f;
-        /* Readable iff within [head - RING, head). */
-        if ((int32_t) (head - t) > 0 && (int32_t) (head - t) <= AES67_RING_FRAMES) {
-            out[f] = r->samples[t & RING_MASK];
+        /* Readable iff within [head - RING, head) and written on this lap. */
+        const uint32_t v = (uint32_t) r->samples[t & RING_MASK];
+        if ((int32_t) (head - t) > 0 && (int32_t) (head - t) <= AES67_RING_FRAMES && (v >> 24) == ring_tag(t)) {
+            out[f] = (v & 0x800000u) ? (int32_t) (v & 0xFFFFFFu) - 0x1000000 : (int32_t) (v & 0xFFFFFFu);
             ++have;
         } else {
             out[f] = 0;
